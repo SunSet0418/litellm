@@ -1300,16 +1300,15 @@ class BaseLLMHTTPHandler:
         if client is None or not isinstance(client, HTTPHandler):
             client = _get_httpx_client()
 
+        json_data = data if files is None and isinstance(data, dict) else None
+
         try:
-            # Make the POST request - clean and simple, always use data and files
             response = client.post(
                 url=complete_url,
                 headers=headers,
-                data=data,
+                data=data if json_data is None else None,
                 files=files,
-                json=(
-                    data if files is None and isinstance(data, dict) else None
-                ),  # Use json param only when no files and data is dict
+                json=json_data,
                 timeout=timeout,
             )
         except Exception as e:
@@ -1373,16 +1372,15 @@ class BaseLLMHTTPHandler:
         else:
             async_httpx_client = client
 
+        json_data = data if files is None and isinstance(data, dict) else None
+
         try:
-            # Make the async POST request - clean and simple, always use data and files
             response = await async_httpx_client.post(
                 url=complete_url,
                 headers=headers,
-                data=data,
+                data=data if json_data is None else None,
                 files=files,
-                json=(
-                    data if files is None and isinstance(data, dict) else None
-                ),  # Use json param only when no files and data is dict
+                json=json_data,
                 timeout=timeout,
             )
         except Exception as e:
@@ -2084,12 +2082,18 @@ class BaseLLMHTTPHandler:
 
         initial_response: Union[AsyncIterator, AnthropicMessagesResponse]
         if stream:
+            from litellm.llms.anthropic.experimental_pass_through.messages.streaming_iterator import (
+                AnthropicMessagesStreamingResponse,
+                anthropic_messages_stream_hidden_params,
+            )
+
             completion_stream = anthropic_messages_provider_config.get_async_streaming_response_iterator(
                 model=model,
                 httpx_response=response,
                 request_body=request_body,
                 litellm_logging_obj=logging_obj,
             )
+            stream_hidden_params = anthropic_messages_stream_hidden_params(response.headers)
 
             if not self._has_agentic_completion_hook(logging_obj):
                 # No callback overrides async_should_run_agentic_loop, so the
@@ -2097,7 +2101,10 @@ class BaseLLMHTTPHandler:
                 # and rebuilding the response from SSE at end-of-stream to call
                 # hooks that all return (False, {}). Stream through directly and
                 # skip that per-chunk + end-of-stream overhead.
-                return completion_stream
+                return AnthropicMessagesStreamingResponse(
+                    completion_stream=completion_stream,
+                    hidden_params=stream_hidden_params,
+                )
 
             from litellm.llms.anthropic.experimental_pass_through.messages.agentic_streaming_iterator import (
                 AgenticAnthropicStreamingIterator,
@@ -2114,7 +2121,10 @@ class BaseLLMHTTPHandler:
                 custom_llm_provider=custom_llm_provider,
                 kwargs={**kwargs, "api_key": api_key} if api_key else kwargs,
             )
-            return initial_response
+            return AnthropicMessagesStreamingResponse(
+                completion_stream=initial_response,
+                hidden_params=stream_hidden_params,
+            )
         else:
             initial_response = anthropic_messages_provider_config.transform_anthropic_messages_response(
                 model=model,
