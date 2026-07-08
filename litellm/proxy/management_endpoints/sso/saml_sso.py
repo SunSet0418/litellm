@@ -382,6 +382,15 @@ class SAMLAuthHandler:
         if email is None and name_id is not None and "@" in name_id:
             email = name_id
 
+        if email is None and SAMLAuthHandler._env("ALLOWED_EMAIL_DOMAINS") is not None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=(
+                    "SAML assertion did not contain an email address, but ALLOWED_EMAIL_DOMAINS "
+                    "restricts sign-in by email domain."
+                ),
+            )
+
         user_id = SAMLAuthHandler._attribute_value(attributes, "SAML_ATTRIBUTE_USER_ID", ()) or name_id or email
         if user_id is None:
             raise HTTPException(

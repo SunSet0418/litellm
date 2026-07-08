@@ -197,6 +197,7 @@ def saml_env(monkeypatch):
         "SAML_ATTRIBUTE_EMAIL",
         "SAML_ATTRIBUTE_TEAM_IDS",
         "SAML_ALLOW_UNSOLICITED",
+        "ALLOWED_EMAIL_DOMAINS",
     ):
         monkeypatch.delenv(var, raising=False)
     return key_pem, cert_pem
@@ -412,6 +413,40 @@ async def test_invalid_email_in_assertion_is_rejected_cleanly(saml_env_idp_initi
         await _acs(_b64(resp), DualCache())
     assert exc.value.status_code == 401
     assert "invalid subject or email" in exc.value.detail
+
+
+@pytest.mark.asyncio
+async def test_email_less_assertion_rejected_when_domain_restriction_configured(
+    saml_env_idp_initiated, monkeypatch
+):
+    key_pem, cert_pem = saml_env_idp_initiated
+    monkeypatch.setenv("ALLOWED_EMAIL_DOMAINS", "example.com")
+    resp = _build_signed_response(
+        key_pem,
+        cert_pem,
+        email="opaque-persistent-id-123",
+        attributes={"givenName": ["Alice"]},
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await _acs(_b64(resp), DualCache())
+    assert exc.value.status_code == 401
+    assert "ALLOWED_EMAIL_DOMAINS" in exc.value.detail
+
+
+@pytest.mark.asyncio
+async def test_email_less_assertion_allowed_without_domain_restriction(saml_env_idp_initiated):
+    key_pem, cert_pem = saml_env_idp_initiated
+    resp = _build_signed_response(
+        key_pem,
+        cert_pem,
+        email="opaque-persistent-id-123",
+        attributes={"givenName": ["Alice"]},
+    )
+
+    result = await _acs(_b64(resp), DualCache())
+    assert result.email is None
+    assert result.id == "opaque-persistent-id-123"
 
 
 @pytest.mark.asyncio
