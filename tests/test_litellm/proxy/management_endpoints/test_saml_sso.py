@@ -9,8 +9,6 @@ makes a test fail.
 
 import base64
 import datetime
-import os
-import sys
 import time
 
 import pytest
@@ -19,8 +17,6 @@ from fastapi import HTTPException
 pytest.importorskip(
     "onelogin", reason="python3-saml (saml extra) is required for SAML SSO tests"
 )
-
-sys.path.insert(0, os.path.abspath("../../../"))
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
