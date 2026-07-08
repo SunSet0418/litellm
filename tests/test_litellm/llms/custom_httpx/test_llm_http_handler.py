@@ -1685,3 +1685,246 @@ async def test_async_audio_transcriptions_sends_dict_data_as_json_body():
     assert captured["content_type"] == "application/json"
     assert captured["body"] == {"config": {"model": "test-model"}, "content": "YXVkaW8="}
     assert response.text == "transcribed"
+
+
+@pytest.mark.asyncio
+async def test_async_retrieve_file_content_raises_on_http_error():
+    """
+    LIT-4008 regression: a provider error response (e.g. Anthropic's 400
+    "File id must have `file_` prefix") must raise instead of being wrapped
+    as file content, which downstream batch cost tracking would parse as an
+    empty results file and bill $0.
+    """
+    from litellm.llms.anthropic.common_utils import AnthropicError
+    from litellm.llms.anthropic.files.transformation import AnthropicFilesConfig
+
+    handler = BaseLLMHTTPHandler()
+    client = Mock(spec=AsyncHTTPHandler)
+    client.get = AsyncMock(
+        return_value=httpx.Response(
+            status_code=400,
+            content=b'{"type":"error","error":{"type":"invalid_request_error","message":"File id must have `file_` prefix."}}',
+        )
+    )
+
+    with pytest.raises(AnthropicError) as exc_info:
+        await handler.async_retrieve_file_content(
+            file_content_request={"file_id": "msgbatch_123"},
+            provider_config=AnthropicFilesConfig(),
+            litellm_params={"api_key": "sk-test"},
+            headers={},
+            logging_obj=Mock(),
+            client=client,
+        )
+
+    assert exc_info.value.status_code == 400
+    assert "file_" in str(exc_info.value)
+
+
+def test_sync_retrieve_file_content_raises_on_http_error():
+    from litellm.llms.anthropic.common_utils import AnthropicError
+    from litellm.llms.anthropic.files.transformation import AnthropicFilesConfig
+
+    handler = BaseLLMHTTPHandler()
+    client = Mock(spec=HTTPHandler)
+    client.get = Mock(
+        return_value=httpx.Response(
+            status_code=404,
+            content=b'{"type":"error","error":{"type":"not_found_error","message":"not found"}}',
+        )
+    )
+
+    with pytest.raises(AnthropicError) as exc_info:
+        handler.retrieve_file_content(
+            file_content_request={"file_id": "file-abc"},
+            provider_config=AnthropicFilesConfig(),
+            litellm_params={"api_key": "sk-test"},
+            headers={},
+            logging_obj=Mock(),
+            client=client,
+        )
+
+    assert exc_info.value.status_code == 404
+
+
+_UPSTREAM_NOT_FOUND_BODY = {
+    "error": {
+        "message": "Response with id 'resp_abc' not found.",
+        "type": "invalid_request_error",
+        "param": None,
+        "code": None,
+    }
+}
+
+
+def _async_handler_returning(status_code: int, body: dict) -> AsyncHTTPHandler:
+    handler = AsyncHTTPHandler()
+    handler.client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(status_code, json=body))
+    )
+    return handler
+
+
+def _sync_handler_returning(status_code: int, body: dict) -> HTTPHandler:
+    handler = HTTPHandler()
+    handler.client = httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(status_code, json=body)))
+    return handler
+
+
+@pytest.mark.asyncio
+async def test_aget_responses_surfaces_upstream_error_status_instead_of_500():
+    client = _async_handler_returning(404, _UPSTREAM_NOT_FOUND_BODY)
+
+    with pytest.raises(litellm.NotFoundError) as excinfo:
+        await litellm.aget_responses(
+            response_id="resp_abc",
+            custom_llm_provider="azure",
+            api_base="https://test.openai.azure.com",
+            api_key="test-key",
+            api_version="2025-03-01-preview",
+            client=client,
+        )
+
+    assert excinfo.value.status_code == 404
+    assert "Response with id 'resp_abc' not found." in excinfo.value.message
+
+
+def test_get_responses_surfaces_upstream_error_status_instead_of_500():
+    client = _sync_handler_returning(404, _UPSTREAM_NOT_FOUND_BODY)
+
+    with pytest.raises(litellm.NotFoundError) as excinfo:
+        litellm.get_responses(
+            response_id="resp_abc",
+            custom_llm_provider="azure",
+            api_base="https://test.openai.azure.com",
+            api_key="test-key",
+            api_version="2025-03-01-preview",
+            client=client,
+        )
+
+    assert excinfo.value.status_code == 404
+    assert "Response with id 'resp_abc' not found." in excinfo.value.message
+
+
+def test_list_input_items_surfaces_upstream_error_status():
+    client = _sync_handler_returning(404, _UPSTREAM_NOT_FOUND_BODY)
+
+    with pytest.raises(litellm.NotFoundError) as excinfo:
+        litellm.list_input_items(
+            response_id="resp_abc",
+            custom_llm_provider="azure",
+            api_base="https://test.openai.azure.com",
+            api_key="test-key",
+            api_version="2025-03-01-preview",
+            client=client,
+        )
+
+    assert excinfo.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_alist_input_items_surfaces_upstream_error_status():
+    client = _async_handler_returning(404, _UPSTREAM_NOT_FOUND_BODY)
+
+    with pytest.raises(litellm.NotFoundError) as excinfo:
+        await litellm.alist_input_items(
+            response_id="resp_abc",
+            custom_llm_provider="azure",
+            api_base="https://test.openai.azure.com",
+            api_key="test-key",
+            api_version="2025-03-01-preview",
+            client=client,
+        )
+
+    assert excinfo.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_anthropic_invalid_thinking_signature_retry_resigns_bedrock_request(monkeypatch):
+    """Regression: after Bedrock rejects a replayed thinking block (400 invalid signature),
+    the strip-and-retry re-sign must not inherit attempt 1's SigV4 Authorization/X-Amz-Date;
+    reusing them over the new stripped body makes AWS return 403 SignatureDoesNotMatch."""
+    from litellm.llms.bedrock.messages.invoke_transformations.anthropic_claude3_transformation import (
+        AmazonAnthropicClaudeMessagesConfig,
+    )
+
+    for env_var in ("AWS_BEARER_TOKEN_BEDROCK", "AWS_SESSION_TOKEN", "AWS_PROFILE"):
+        monkeypatch.delenv(env_var, raising=False)
+
+    handler = BaseLLMHTTPHandler()
+    provider_config = AmazonAnthropicClaudeMessagesConfig()
+    litellm_params = GenericLiteLLMParams(
+        aws_access_key_id="AKIAIOSFODNN7EXAMPLE",
+        aws_secret_access_key="wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+        aws_region_name="us-east-1",
+    )
+    request_url = "https://bedrock-runtime.us-east-1.amazonaws.com/model/test-model/invoke"
+    request_body = {
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": 100,
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "x", "signature": ""},
+                    {"type": "text", "text": "ok"},
+                ],
+            },
+            {"role": "user", "content": "continue"},
+        ],
+    }
+    first_attempt_headers, signed_json_body = provider_config.sign_request(
+        headers={"Content-Type": "application/json"},
+        optional_params=dict(litellm_params),
+        request_data=request_body,
+        api_base=request_url,
+        api_key=None,
+        stream=False,
+        fake_stream=False,
+        model="test-model",
+    )
+
+    posts: list = []
+    invalid_signature_response = httpx.Response(
+        400,
+        text='{"message": "messages.1.content.0: Invalid `signature` in `thinking` block"}',
+        request=httpx.Request("POST", request_url),
+    )
+    ok_response = httpx.Response(200, json={"id": "msg_1"}, request=httpx.Request("POST", request_url))
+
+    class FakeAsyncClient:
+        async def post(self, url, headers, data, stream=False, logging_obj=None):
+            posts.append({"headers": dict(headers), "data": data})
+            return invalid_signature_response if len(posts) == 1 else ok_response
+
+    logging_obj = Mock()
+    logging_obj.model_call_details = {}
+
+    response = await handler._async_post_anthropic_messages_with_http_error_retry(
+        async_httpx_client=FakeAsyncClient(),
+        request_url=request_url,
+        headers=dict(first_attempt_headers),
+        signed_json_body=signed_json_body,
+        request_body=request_body,
+        stream=False,
+        logging_obj=logging_obj,
+        provider_config=provider_config,
+        litellm_params=litellm_params,
+        api_key=None,
+        model="test-model",
+    )
+
+    assert response.status_code == 200
+    assert len(posts) == 2
+    retry_payload = json.loads(posts[1]["data"])
+    retry_blocks = [
+        block
+        for message in retry_payload["messages"]
+        if isinstance(message.get("content"), list)
+        for block in message["content"]
+    ]
+    assert retry_blocks and all(block["type"] != "thinking" for block in retry_blocks)
+    retry_authorization = posts[1]["headers"]["Authorization"]
+    assert retry_authorization.startswith("AWS4-HMAC-SHA256")
+    assert retry_authorization != first_attempt_headers["Authorization"]
