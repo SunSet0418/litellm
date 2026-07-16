@@ -26,6 +26,14 @@ const ssoProviderLogoMap: Record<string, string> = {
   saml: "",
 };
 
+const ssoProviderLabelMap: Record<string, string> = {
+  okta: "Okta / Auth0",
+  saml: "SAML",
+};
+
+const getSSOProviderLabel = (value: string): string =>
+  ssoProviderLabelMap[value.toLowerCase()] ?? value.charAt(0).toUpperCase() + value.slice(1);
+
 // Define the SSO provider configuration type
 interface SSOProviderConfig {
   envVarMap: Record<string, string>;
@@ -405,14 +413,7 @@ const SSOModals: React.FC<SSOModalsProps> = ({
                           style={{ height: 24, width: 24, marginRight: 12, objectFit: "contain" }}
                         />
                       )}
-                      <span>
-                        {value.toLowerCase() === "okta"
-                          ? "Okta / Auth0"
-                          : value.toLowerCase() === "saml"
-                            ? "SAML"
-                            : value.charAt(0).toUpperCase() + value.slice(1)}{" "}
-                        SSO
-                      </span>
+                      <span>{getSSOProviderLabel(value)} SSO</span>
                     </div>
                   </Select.Option>
                 ))}
