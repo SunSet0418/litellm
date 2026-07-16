@@ -842,7 +842,7 @@ def process_sso_jwt_access_token(
     return None
 
 
-async def _raise_if_sso_exceeds_free_user_limit(premium_user: bool, prisma_client: Optional[PrismaClient]) -> None:
+async def _raise_if_sso_exceeds_free_user_limit(premium_user: bool, prisma_client: PrismaClient | None) -> None:
     """Free tier allows SSO for up to 5 billable users; beyond that requires an Enterprise license."""
     if premium_user is True:
         return
@@ -1911,7 +1911,7 @@ async def auth_callback(request: Request, state: Optional[str] = None):
 
 
 @router.get("/sso/saml/login", tags=["experimental"], include_in_schema=False)
-async def saml_login(request: Request, return_to: Optional[str] = None):
+async def saml_login(request: Request, return_to: str | None = None):
     """SP-initiated SAML login. Redirects the user to the configured IdP."""
     from litellm.proxy.proxy_server import user_api_key_cache
 
@@ -1972,7 +1972,7 @@ async def saml_callback(request: Request):
     await _raise_if_sso_exceeds_free_user_limit(premium_user, prisma_client)
 
     ui_access_mode = general_settings.get("ui_access_mode", None)
-    cp_return_to: Optional[str] = (
+    cp_return_to: str | None = (
         relay_state
         if isinstance(relay_state, str) and SSOAuthenticationHandler._validate_return_to(relay_state)
         else None

@@ -27,7 +27,7 @@ import hashlib
 import os
 import secrets
 import time
-from typing import Optional, cast
+from typing import cast
 
 from fastapi import HTTPException, Request, status
 from fastapi.responses import RedirectResponse
@@ -108,7 +108,7 @@ class SAMLAuthHandler:
     """SP- and IdP-initiated SAML 2.0 login for the admin UI."""
 
     @staticmethod
-    def _env(name: str, default: Optional[str] = None) -> Optional[str]:
+    def _env(name: str, default: str | None = None) -> str | None:
         return os.getenv(name, default)
 
     @staticmethod
@@ -206,7 +206,7 @@ class SAMLAuthHandler:
         return OneLogin_Saml2_IdPMetadataParser.merge_settings(sp_settings, idp_settings)
 
     @staticmethod
-    def _prepare_request_data(request: Request, post_data: Optional[dict[str, str]] = None) -> dict[str, object]:
+    def _prepare_request_data(request: Request, post_data: dict[str, str] | None = None) -> dict[str, object]:
         base = SAMLAuthHandler._base_url(request)
         scheme, _, host_part = base.partition("://")
         host = host_part.split("/", 1)[0]
@@ -222,7 +222,7 @@ class SAMLAuthHandler:
     async def _build_auth(
         request: Request,
         cache: DualCache,
-        post_data: Optional[dict[str, str]] = None,
+        post_data: dict[str, str] | None = None,
     ) -> "OneLogin_Saml2_Auth":
         if not SAML_AVAILABLE:
             raise _saml_unavailable_error()
@@ -239,12 +239,12 @@ class SAMLAuthHandler:
 
     @staticmethod
     async def build_login_redirect(
-        request: Request, cache: DualCache, relay_state: Optional[str] = None
+        request: Request, cache: DualCache, relay_state: str | None = None
     ) -> RedirectResponse:
         auth = await SAMLAuthHandler._build_auth(request, cache)
         redirect_url = cast(str, auth.login(return_to=relay_state))  # cast-ok: untyped python3-saml
         response = RedirectResponse(url=redirect_url, status_code=303)
-        request_id = cast(Optional[str], auth.get_last_request_id())  # cast-ok: untyped python3-saml
+        request_id = cast(str | None, auth.get_last_request_id())  # cast-ok: untyped python3-saml
         if request_id is not None:
             cache.set_cache(
                 key=f"{_SAML_AUTHN_REQUEST_CACHE_PREFIX}:{request_id}",
@@ -313,19 +313,19 @@ class SAMLAuthHandler:
         )
 
     @staticmethod
-    def _response_in_response_to(auth: "OneLogin_Saml2_Auth") -> Optional[str]:
+    def _response_in_response_to(auth: "OneLogin_Saml2_Auth") -> str | None:
         """The request id this response answers, read from the Response element or, when the
         IdP only stamps it on the bearer SubjectConfirmationData, from there. A non-None value
         marks the response as solicited (SP-initiated) and so requiring browser binding."""
-        value = cast(Optional[str], auth.get_last_response_in_response_to())  # cast-ok: untyped python3-saml
+        value = cast(str | None, auth.get_last_response_in_response_to())  # cast-ok: untyped python3-saml
         if value:
             return value
-        xml = cast(Optional[bytes], auth.get_last_response_xml())  # cast-ok: untyped python3-saml
+        xml = cast(bytes | None, auth.get_last_response_xml())  # cast-ok: untyped python3-saml
         if not xml:
             return None
         root = OneLogin_Saml2_XML.to_etree(xml)
         for node in OneLogin_Saml2_XML.query(root, "//saml:SubjectConfirmationData[@InResponseTo]"):
-            irt = cast(Optional[str], node.get("InResponseTo"))  # cast-ok: untyped python3-saml
+            irt = cast(str | None, node.get("InResponseTo"))  # cast-ok: untyped python3-saml
             if irt:
                 return irt
         return None
@@ -334,7 +334,7 @@ class SAMLAuthHandler:
     async def _enforce_response_binding(
         auth: "OneLogin_Saml2_Auth",
         cache: DualCache,
-        browser_request_id: Optional[str],
+        browser_request_id: str | None,
     ) -> None:
         in_response_to = SAMLAuthHandler._response_in_response_to(auth)
 
@@ -361,7 +361,7 @@ class SAMLAuthHandler:
                 detail="Unsolicited (IdP-initiated) SAML responses are disabled.",
             )
 
-        assertion_id = cast(Optional[str], auth.get_last_assertion_id())  # cast-ok: untyped python3-saml
+        assertion_id = cast(str | None, auth.get_last_assertion_id())  # cast-ok: untyped python3-saml
         if assertion_id is not None:
             consumed_key = f"{_SAML_CONSUMED_ASSERTION_CACHE_PREFIX}:{assertion_id}"
             consumed_count = await cache.async_increment_cache(
@@ -376,7 +376,7 @@ class SAMLAuthHandler:
     @staticmethod
     def _result_from_auth(auth: "OneLogin_Saml2_Auth") -> CustomOpenID:
         attributes = cast(dict[str, list[str]], auth.get_attributes())  # cast-ok: untyped python3-saml
-        name_id = cast(Optional[str], auth.get_nameid())  # cast-ok: untyped python3-saml
+        name_id = cast(str | None, auth.get_nameid())  # cast-ok: untyped python3-saml
 
         email = SAMLAuthHandler._attribute_value(attributes, "SAML_ATTRIBUTE_EMAIL", _EMAIL_ATTRIBUTE_CANDIDATES)
         if email is None and name_id is not None and "@" in name_id:
@@ -436,7 +436,7 @@ class SAMLAuthHandler:
         attributes: dict[str, list[str]],
         env_override: str,
         candidates: tuple[str, ...],
-    ) -> Optional[str]:
+    ) -> str | None:
         values = SAMLAuthHandler._attribute_values(attributes, env_override, candidates)
         return values[0] if values else None
 
