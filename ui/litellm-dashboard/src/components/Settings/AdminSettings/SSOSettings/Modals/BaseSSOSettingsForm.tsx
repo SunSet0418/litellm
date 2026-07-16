@@ -17,6 +17,7 @@ export interface SSOProviderConfig {
     label: string;
     name: string;
     placeholder?: string;
+    required?: boolean;
   }>;
 }
 
@@ -51,6 +52,7 @@ export const ssoProviderConfigs: Record<string, SSOProviderConfig> = {
       generic_authorization_endpoint: "GENERIC_AUTHORIZATION_ENDPOINT",
       generic_token_endpoint: "GENERIC_TOKEN_ENDPOINT",
       generic_userinfo_endpoint: "GENERIC_USERINFO_ENDPOINT",
+      generic_scope: "GENERIC_SCOPE",
     },
     fields: [
       { label: "Generic Client ID", name: "generic_client_id" },
@@ -66,6 +68,7 @@ export const ssoProviderConfigs: Record<string, SSOProviderConfig> = {
         name: "generic_userinfo_endpoint",
         placeholder: "https://your-domain/userinfo",
       },
+      { label: "Scopes", name: "generic_scope", placeholder: "openid email profile", required: false },
     ],
   },
   generic: {
@@ -75,6 +78,7 @@ export const ssoProviderConfigs: Record<string, SSOProviderConfig> = {
       generic_authorization_endpoint: "GENERIC_AUTHORIZATION_ENDPOINT",
       generic_token_endpoint: "GENERIC_TOKEN_ENDPOINT",
       generic_userinfo_endpoint: "GENERIC_USERINFO_ENDPOINT",
+      generic_scope: "GENERIC_SCOPE",
     },
     fields: [
       { label: "Generic Client ID", name: "generic_client_id" },
@@ -82,6 +86,7 @@ export const ssoProviderConfigs: Record<string, SSOProviderConfig> = {
       { label: "Authorization Endpoint", name: "generic_authorization_endpoint" },
       { label: "Token Endpoint", name: "generic_token_endpoint" },
       { label: "Userinfo Endpoint", name: "generic_userinfo_endpoint" },
+      { label: "Scopes", name: "generic_scope", placeholder: "openid email profile", required: false },
     ],
   },
 };
@@ -96,7 +101,7 @@ export const renderProviderFields = (provider: string) => {
       key={field.name}
       label={field.label}
       name={field.name}
-      rules={[{ required: true, message: `Please enter the ${field.label.toLowerCase()}` }]}
+      rules={[{ required: field.required !== false, message: `Please enter the ${field.label.toLowerCase()}` }]}
     >
       {field.name.includes("client") ? <Input.Password /> : <TextInput placeholder={field.placeholder} />}
     </Form.Item>

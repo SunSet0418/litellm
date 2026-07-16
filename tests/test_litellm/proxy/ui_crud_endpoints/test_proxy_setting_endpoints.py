@@ -386,6 +386,124 @@ class TestProxySettingEndpoints:
         call_args = mock_prisma.db.litellm_ssoconfig.find_unique.call_args
         assert call_args.kwargs["where"]["id"] == "sso_config"
 
+    def _mock_sso_db_record(self, monkeypatch, sso_settings):
+        """Point /get/sso_settings at a stored SSO row (or None for no row)."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        mock_prisma = MagicMock()
+        if sso_settings is None:
+            mock_db_record = None
+        else:
+            mock_db_record = MagicMock()
+            mock_db_record.sso_settings = sso_settings
+        mock_prisma.db.litellm_ssoconfig.find_unique = AsyncMock(return_value=mock_db_record)
+        monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", mock_prisma)
+
+        from litellm.proxy.proxy_server import proxy_config
+
+        monkeypatch.setattr(
+            proxy_config,
+            "_decrypt_and_set_db_env_variables",
+            lambda environment_variables: environment_variables,
+        )
+
+    def test_get_sso_settings_falls_back_to_process_env(
+        self, mock_proxy_config, mock_auth, monkeypatch
+    ):
+        """
+        Regression for LIT-4165.
+
+        SSO configured purely as process env vars (helm/terraform, no UI writes)
+        logs users in successfully, because ui_sso.py resolves every setting from
+        os.environ. /get/sso_settings read only the sso_config table though, so
+        the Admin UI showed "not configured" for a working SSO deployment and hid
+        the Edit/Delete controls behind an empty-state placeholder.
+        """
+        self._mock_sso_db_record(monkeypatch, None)
+        monkeypatch.setenv("GENERIC_CLIENT_ID", "env-client-id")
+        monkeypatch.setenv("GENERIC_CLIENT_SECRET", "env-client-secret-value")
+        monkeypatch.setenv("GENERIC_AUTHORIZATION_ENDPOINT", "https://idp.example.com/authorize")
+        monkeypatch.setenv("GENERIC_TOKEN_ENDPOINT", "https://idp.example.com/token")
+        monkeypatch.setenv("GENERIC_USERINFO_ENDPOINT", "https://idp.example.com/userinfo")
+        monkeypatch.setenv("GENERIC_SCOPE", "openid email profile groups")
+        monkeypatch.setenv("PROXY_BASE_URL", "https://gateway.example.com")
+
+        response = client.get("/get/sso_settings")
+
+        assert response.status_code == 200
+        values = response.json()["values"]
+
+        # Every one of these was None before the fix, despite SSO working.
+        assert values["generic_client_id"] == "env-client-id"
+        assert values["generic_authorization_endpoint"] == "https://idp.example.com/authorize"
+        assert values["generic_token_endpoint"] == "https://idp.example.com/token"
+        assert values["generic_userinfo_endpoint"] == "https://idp.example.com/userinfo"
+        assert values["generic_scope"] == "openid email profile groups"
+        assert values["proxy_base_url"] == "https://gateway.example.com"
+
+        # An env-sourced secret is masked exactly like a stored one.
+        assert values["generic_client_secret"] not in (None, "env-client-secret-value")
+        assert "*" in values["generic_client_secret"]
+
+    def test_get_sso_settings_prefers_stored_over_process_env(
+        self, mock_proxy_config, mock_auth, monkeypatch
+    ):
+        """A stored value wins; only fields absent from the row fall back to env."""
+        self._mock_sso_db_record(monkeypatch, {"generic_client_id": "stored-client-id"})
+        monkeypatch.setenv("GENERIC_CLIENT_ID", "env-client-id")
+        monkeypatch.setenv("GENERIC_TOKEN_ENDPOINT", "https://idp.example.com/token")
+
+        response = client.get("/get/sso_settings")
+
+        assert response.status_code == 200
+        values = response.json()["values"]
+        assert values["generic_client_id"] == "stored-client-id"
+        assert values["generic_token_endpoint"] == "https://idp.example.com/token"
+
+    def test_get_sso_settings_blank_stored_value_falls_back_to_process_env(
+        self, mock_proxy_config, mock_auth, monkeypatch
+    ):
+        """
+        Blank means absent. update_sso_settings clears the env var for a blank
+        field, so a blank row entry cannot describe a live setting; os.environ is
+        the effective config and is what the UI must report.
+        """
+        self._mock_sso_db_record(monkeypatch, {"generic_client_id": "   ", "generic_token_endpoint": ""})
+        monkeypatch.setenv("GENERIC_CLIENT_ID", "env-client-id")
+        monkeypatch.setenv("GENERIC_TOKEN_ENDPOINT", "https://idp.example.com/token")
+
+        response = client.get("/get/sso_settings")
+
+        assert response.status_code == 200
+        values = response.json()["values"]
+        assert values["generic_client_id"] == "env-client-id"
+        assert values["generic_token_endpoint"] == "https://idp.example.com/token"
+
+    def test_get_sso_settings_unset_everywhere_stays_none(
+        self, mock_proxy_config, mock_auth, monkeypatch
+    ):
+        """A field set in neither source is reported unset rather than invented."""
+        self._mock_sso_db_record(monkeypatch, None)
+        for env_var in (
+            "GENERIC_CLIENT_ID",
+            "GENERIC_CLIENT_SECRET",
+            "GENERIC_TOKEN_ENDPOINT",
+            "GENERIC_SCOPE",
+            "GOOGLE_CLIENT_ID",
+            "MICROSOFT_CLIENT_ID",
+            "PROXY_BASE_URL",
+        ):
+            monkeypatch.delenv(env_var, raising=False)
+
+        response = client.get("/get/sso_settings")
+
+        assert response.status_code == 200
+        values = response.json()["values"]
+        assert values["generic_client_id"] is None
+        assert values["generic_client_secret"] is None
+        assert values["generic_scope"] is None
+        assert values["google_client_id"] is None
+
     def test_update_sso_settings(self, mock_proxy_config, mock_auth, monkeypatch):
         """Test updating the SSO settings to the dedicated database table"""
         import json

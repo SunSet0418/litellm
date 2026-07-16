@@ -15,7 +15,7 @@ import threading
 import time
 import traceback
 import warnings
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from typing import (
     TYPE_CHECKING,
@@ -14700,6 +14700,27 @@ def _apply_callback_role_gate(entries: list, is_full_admin: bool) -> list:
     return [{**entry, "variables": _redact_callback_env_vars(entry.get("variables") or {})} for entry in entries]
 
 
+def _resolve_alerting_env_var(var_name: str, stored_environment_variables: Mapping[str, object]) -> str | None:
+    stored = stored_environment_variables.get(var_name)
+    if stored is not None:
+        return str(stored)
+    return os.getenv(var_name)
+
+
+def _resolve_alerting_env_vars(
+    var_names: Sequence[str], stored_environment_variables: Mapping[str, object]
+) -> dict[str, str | None]:
+    """Resolve alerting settings to the values the alerting code actually reads.
+
+    Config/DB-stored ``environment_variables`` win over the process environment,
+    matching the load order in ``ProxyConfig.get_config``, which pushes stored
+    values into ``os.environ``. A setting the operator supplied only as a process
+    env var has no stored entry, so it resolves from ``os.environ`` rather than
+    being reported as unset.
+    """
+    return {var_name: _resolve_alerting_env_var(var_name, stored_environment_variables) for var_name in var_names}
+
+
 def _apply_alerting_env_role_gate(env_vars: dict, is_full_admin: bool) -> dict:
     if is_full_admin:
         return mask_sensitive_keys(env_vars, _ALERTING_SENSITIVE_VARS)
@@ -15273,11 +15294,9 @@ async def get_config(
             _slack_vars = [
                 "SLACK_WEBHOOK_URL",
             ]
-            _slack_env_vars = {
-                _var: (value if (value := environment_variables.get(_var)) is not None else os.getenv(_var))
-                for _var in _slack_vars
-            }
-            _slack_env_vars = _apply_alerting_env_role_gate(_slack_env_vars, is_full_admin)
+            _slack_env_vars = _apply_alerting_env_role_gate(
+                _resolve_alerting_env_vars(_slack_vars, environment_variables), is_full_admin
+            )
 
             _alerting_types = proxy_logging_obj.slack_alerting_instance.alert_types
             _all_alert_types = proxy_logging_obj.slack_alerting_instance._all_possible_alert_types()
@@ -15296,6 +15315,7 @@ async def get_config(
         _email_vars = [
             "SMTP_HOST",
             "SMTP_PORT",
+            "SMTP_TLS",
             "SMTP_USERNAME",
             "SMTP_PASSWORD",
             "SMTP_SENDER_EMAIL",
@@ -15304,7 +15324,7 @@ async def get_config(
             "EMAIL_SUPPORT_CONTACT",
         ]
         _email_env_vars = _apply_alerting_env_role_gate(
-            {_var: environment_variables.get(_var) for _var in _email_vars}, is_full_admin
+            _resolve_alerting_env_vars(_email_vars, environment_variables), is_full_admin
         )
 
         alerting_data.append(

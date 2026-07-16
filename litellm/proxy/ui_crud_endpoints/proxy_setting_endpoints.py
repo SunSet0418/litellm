@@ -1,6 +1,8 @@
 #### CRUD ENDPOINTS for UI Settings #####
 import asyncio
 import json
+import os
+from collections.abc import Mapping
 from typing import Any, Dict, List, Optional, Set, Tuple, Type, Union
 from urllib.parse import urlparse
 
@@ -34,6 +36,40 @@ _SSO_SENSITIVE_FIELDS: Set[str] = {
     "microsoft_client_secret",
     "generic_client_secret",
 }
+
+# Maps each SSOConfig field to the env var the SSO login path reads it from.
+# Single-sourced so /get/sso_settings resolves exactly the vars
+# /update/sso_settings writes, and the two can never drift apart.
+_SSO_FIELD_ENV_VARS: dict[str, str] = {
+    "google_client_id": "GOOGLE_CLIENT_ID",
+    "google_client_secret": "GOOGLE_CLIENT_SECRET",
+    "microsoft_client_id": "MICROSOFT_CLIENT_ID",
+    "microsoft_client_secret": "MICROSOFT_CLIENT_SECRET",
+    "microsoft_tenant": "MICROSOFT_TENANT",
+    "generic_client_id": "GENERIC_CLIENT_ID",
+    "generic_client_secret": "GENERIC_CLIENT_SECRET",
+    "generic_authorization_endpoint": "GENERIC_AUTHORIZATION_ENDPOINT",
+    "generic_token_endpoint": "GENERIC_TOKEN_ENDPOINT",
+    "generic_userinfo_endpoint": "GENERIC_USERINFO_ENDPOINT",
+    "generic_scope": "GENERIC_SCOPE",
+    "proxy_base_url": "PROXY_BASE_URL",
+}
+
+
+def _resolve_sso_field(stored_sso_settings: Mapping[str, Any], field_name: str) -> str | None:
+    """Resolve one SSO field to the value the SSO login path actually reads.
+
+    The stored row wins; a field absent or blank there falls back to the process
+    environment. ``os.environ`` is the effective SSO config: the login path reads
+    only env vars, and stored settings reach it by being pushed into the
+    environment on startup and on save. So a setting supplied purely as a process
+    env var is live even though no row exists for it, and clearing a field in the
+    UI unsets the env var, which makes the fallback report it as unset too.
+    """
+    stored = stored_sso_settings.get(field_name)
+    if isinstance(stored, str) and stored.strip():
+        return stored
+    return os.environ.get(_SSO_FIELD_ENV_VARS[field_name])
 
 
 class IPAddress(BaseModel):
@@ -762,17 +798,20 @@ async def get_sso_settings():
     # Build SSO config with database values or environment fallback
 
     sso_config = SSOConfig(
-        google_client_id=decrypted_sso_settings_dict.get("google_client_id", None),
-        google_client_secret=decrypted_sso_settings_dict.get("google_client_secret", None),
-        microsoft_client_id=decrypted_sso_settings_dict.get("microsoft_client_id", None),
-        microsoft_client_secret=decrypted_sso_settings_dict.get("microsoft_client_secret", None),
-        microsoft_tenant=decrypted_sso_settings_dict.get("microsoft_tenant", None),
-        generic_client_id=decrypted_sso_settings_dict.get("generic_client_id", None),
-        generic_client_secret=decrypted_sso_settings_dict.get("generic_client_secret", None),
-        generic_authorization_endpoint=decrypted_sso_settings_dict.get("generic_authorization_endpoint", None),
-        generic_token_endpoint=decrypted_sso_settings_dict.get("generic_token_endpoint", None),
-        generic_userinfo_endpoint=decrypted_sso_settings_dict.get("generic_userinfo_endpoint", None),
-        proxy_base_url=decrypted_sso_settings_dict.get("proxy_base_url", None),
+        google_client_id=_resolve_sso_field(decrypted_sso_settings_dict, "google_client_id"),
+        google_client_secret=_resolve_sso_field(decrypted_sso_settings_dict, "google_client_secret"),
+        microsoft_client_id=_resolve_sso_field(decrypted_sso_settings_dict, "microsoft_client_id"),
+        microsoft_client_secret=_resolve_sso_field(decrypted_sso_settings_dict, "microsoft_client_secret"),
+        microsoft_tenant=_resolve_sso_field(decrypted_sso_settings_dict, "microsoft_tenant"),
+        generic_client_id=_resolve_sso_field(decrypted_sso_settings_dict, "generic_client_id"),
+        generic_client_secret=_resolve_sso_field(decrypted_sso_settings_dict, "generic_client_secret"),
+        generic_authorization_endpoint=_resolve_sso_field(
+            decrypted_sso_settings_dict, "generic_authorization_endpoint"
+        ),
+        generic_token_endpoint=_resolve_sso_field(decrypted_sso_settings_dict, "generic_token_endpoint"),
+        generic_userinfo_endpoint=_resolve_sso_field(decrypted_sso_settings_dict, "generic_userinfo_endpoint"),
+        generic_scope=_resolve_sso_field(decrypted_sso_settings_dict, "generic_scope"),
+        proxy_base_url=_resolve_sso_field(decrypted_sso_settings_dict, "proxy_base_url"),
         user_email=decrypted_sso_settings_dict.get("user_email"),
         ui_access_mode=decrypted_sso_settings_dict.get("ui_access_mode"),
         role_mappings=role_mappings,
@@ -841,21 +880,6 @@ async def update_sso_settings(
             detail={"error": "Set `'STORE_MODEL_IN_DB='True'` in your env to enable this feature."},
         )
 
-    # Update environment variables
-    env_var_mapping = {
-        "google_client_id": "GOOGLE_CLIENT_ID",
-        "google_client_secret": "GOOGLE_CLIENT_SECRET",
-        "microsoft_client_id": "MICROSOFT_CLIENT_ID",
-        "microsoft_client_secret": "MICROSOFT_CLIENT_SECRET",
-        "microsoft_tenant": "MICROSOFT_TENANT",
-        "generic_client_id": "GENERIC_CLIENT_ID",
-        "generic_client_secret": "GENERIC_CLIENT_SECRET",
-        "generic_authorization_endpoint": "GENERIC_AUTHORIZATION_ENDPOINT",
-        "generic_token_endpoint": "GENERIC_TOKEN_ENDPOINT",
-        "generic_userinfo_endpoint": "GENERIC_USERINFO_ENDPOINT",
-        "proxy_base_url": "PROXY_BASE_URL",
-    }
-
     # Read the existing SSO row first so the audit log captures a real
     # before/after diff. Stored values are encrypted; decrypt them so the
     # before-snapshot has the same shape as after_value, and rely on
@@ -884,8 +908,8 @@ async def update_sso_settings(
     # Update environment variables in config and in memory
     sso_data = sso_config.model_dump()
     for field_name, value in sso_data.items():
-        if field_name in env_var_mapping:
-            env_var_name = env_var_mapping[field_name]
+        if field_name in _SSO_FIELD_ENV_VARS:
+            env_var_name = _SSO_FIELD_ENV_VARS[field_name]
             if value:
                 os.environ[env_var_name] = value
             else:
@@ -935,7 +959,7 @@ async def update_sso_settings(
             else:
                 environment_variables = {}
 
-            env_vars_to_remove = set(env_var_mapping.values())
+            env_vars_to_remove = set(_SSO_FIELD_ENV_VARS.values())
             filtered_env_vars = {
                 key: value for key, value in environment_variables.items() if key not in env_vars_to_remove
             }
