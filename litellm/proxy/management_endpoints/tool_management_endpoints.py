@@ -10,8 +10,8 @@ POST /v1/tool/policy            - Update the input_policy / output_policy for a 
 """
 
 import uuid
-from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, List, Optional
+from datetime import datetime, timedelta, timezone
+from typing import TYPE_CHECKING, Annotated, Any, List, Optional, TypedDict
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
@@ -39,6 +39,9 @@ from litellm.types.tool_management import (
     ToolPolicyOptionsResponse,
     ToolPolicyUpdateRequest,
     ToolPolicyUpdateResponse,
+    ToolSpendDailyEntry,
+    ToolSpendEntry,
+    ToolSpendResponse,
     ToolUsageLogEntry,
     ToolUsageLogsResponse,
 )
@@ -122,6 +125,114 @@ async def list_tools(
     except Exception as e:
         verbose_proxy_logger.exception("Error listing tools: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+def _parse_day_bound(value: str | None, *, end_of_day: bool) -> datetime | None:
+    if not value:
+        return None
+    suffix = "T23:59:59" if end_of_day else "T00:00:00"
+    try:
+        return datetime.strptime(value + suffix, "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+class _ToolSpendRow(TypedDict, total=False):
+    date: str
+    tool_name: str
+    call_count: int
+    spend: float
+    total_tokens: int
+
+
+def _build_tool_spend_response(
+    rows: List[_ToolSpendRow],
+    start_date: str | None,
+    end_date: str | None,
+) -> ToolSpendResponse:
+    daily = tuple(
+        ToolSpendDailyEntry(
+            date=str(r.get("date") or ""),
+            tool_name=str(r.get("tool_name") or ""),
+            spend=float(r.get("spend") or 0.0),
+            call_count=int(r.get("call_count") or 0),
+        )
+        for r in rows
+        if r.get("tool_name")
+    )
+    tool_names = tuple(dict.fromkeys(d.tool_name for d in daily))
+    by_tool = tuple(
+        sorted(
+            (
+                ToolSpendEntry(
+                    tool_name=name,
+                    spend=sum(float(r.get("spend") or 0.0) for r in rows if r.get("tool_name") == name),
+                    call_count=sum(int(r.get("call_count") or 0) for r in rows if r.get("tool_name") == name),
+                    total_tokens=sum(int(r.get("total_tokens") or 0) for r in rows if r.get("tool_name") == name),
+                )
+                for name in tool_names
+            ),
+            key=lambda e: e.spend,
+            reverse=True,
+        )
+    )
+    return ToolSpendResponse(
+        by_tool=list(by_tool),
+        daily=list(daily),
+        total_spend=sum(e.spend for e in by_tool),
+        start_date=start_date,
+        end_date=end_date,
+    )
+
+
+@router.get(
+    "/v1/tool/spend",
+    tags=["tool management"],
+    dependencies=[Depends(user_api_key_auth)],
+    response_model=ToolSpendResponse,
+)
+async def get_tool_spend(
+    user_api_key_dict: Annotated[UserAPIKeyAuth, Depends(user_api_key_auth)],
+    start_date: Annotated[str | None, Query(description="YYYY-MM-DD (defaults to 30 days ago)")] = None,
+    end_date: Annotated[str | None, Query(description="YYYY-MM-DD (defaults to today)")] = None,
+):
+    """
+    Spend attributed to each tool over a date range, for the Cost Optimization dashboard.
+
+    Joins ``LiteLLM_SpendLogToolIndex`` (which tool names ran on which request) to
+    ``LiteLLM_SpendLogs`` (what the request cost). A request that used multiple tools
+    counts its full spend toward each of those tools.
+    """
+    from litellm.proxy.proxy_server import prisma_client
+
+    if prisma_client is None:
+        raise HTTPException(status_code=500, detail=CommonProxyErrors.db_not_connected_error.value)
+
+    now = datetime.now(timezone.utc)
+    end_dt = _parse_day_bound(end_date, end_of_day=True) or now
+    start_dt = _parse_day_bound(start_date, end_of_day=False) or (end_dt - timedelta(days=30))
+
+    rows = await prisma_client.db.query_raw(
+        """
+        SELECT to_char(ti.start_time AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS date,
+               ti.tool_name AS tool_name,
+               COUNT(*)::int AS call_count,
+               COALESCE(SUM(sl.spend), 0)::double precision AS spend,
+               COALESCE(SUM(sl.total_tokens), 0)::bigint AS total_tokens
+        FROM "LiteLLM_SpendLogToolIndex" ti
+        JOIN "LiteLLM_SpendLogs" sl ON sl.request_id = ti.request_id
+        WHERE ti.start_time >= $1 AND ti.start_time <= $2
+        GROUP BY date, ti.tool_name
+        ORDER BY date ASC, spend DESC
+        """,
+        start_dt,
+        end_dt,
+    )
+    return _build_tool_spend_response(
+        rows=list(rows or []),
+        start_date=start_dt.strftime("%Y-%m-%d"),
+        end_date=end_dt.strftime("%Y-%m-%d"),
+    )
 
 
 @router.get(

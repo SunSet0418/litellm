@@ -18,7 +18,10 @@ from fastapi.testclient import TestClient
 
 sys.path.insert(0, os.path.abspath("../../.."))
 
-from litellm.proxy.management_endpoints.tool_management_endpoints import router
+from litellm.proxy.management_endpoints.tool_management_endpoints import (
+    _build_tool_spend_response,
+    router,
+)
 from litellm.types.tool_management import LiteLLM_ToolTableRow
 
 # --- helpers ---
@@ -147,3 +150,58 @@ class TestToolManagementEndpoints:
             json={"tool_name": "my_tool", "input_policy": "invalid_value"},
         )
         assert resp.status_code == 422
+
+    def test_tool_spend_route_not_shadowed_by_get_tool(self):
+        prisma = MagicMock()
+        prisma.db.query_raw = AsyncMock(return_value=[])
+        with patch("litellm.proxy.proxy_server.prisma_client", prisma):
+            resp = self.client.get("/v1/tool/spend")
+        assert resp.status_code == 200
+        assert resp.json()["by_tool"] == []
+
+    def test_tool_spend_aggregates_and_sorts(self):
+        rows = [
+            {"date": "2026-07-01", "tool_name": "search", "call_count": 2, "spend": 1.0, "total_tokens": 100},
+            {"date": "2026-07-02", "tool_name": "search", "call_count": 1, "spend": 4.0, "total_tokens": 50},
+            {"date": "2026-07-01", "tool_name": "read_file", "call_count": 3, "spend": 2.0, "total_tokens": 300},
+        ]
+        prisma = MagicMock()
+        prisma.db.query_raw = AsyncMock(return_value=rows)
+        with patch("litellm.proxy.proxy_server.prisma_client", prisma):
+            resp = self.client.get("/v1/tool/spend?start_date=2026-07-01&end_date=2026-07-02")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert [t["tool_name"] for t in body["by_tool"]] == ["search", "read_file"]
+        search = body["by_tool"][0]
+        assert search["spend"] == 5.0
+        assert search["call_count"] == 3
+        assert search["total_tokens"] == 150
+        assert len(body["daily"]) == 3
+        assert body["start_date"] == "2026-07-01"
+        assert body["end_date"] == "2026-07-02"
+
+    @patch("litellm.proxy.proxy_server.prisma_client", None)
+    def test_tool_spend_no_db_returns_500(self):
+        resp = self.client.get("/v1/tool/spend")
+        assert resp.status_code == 500
+
+
+class TestBuildToolSpendResponse:
+    def test_multi_tool_request_double_counts_spend_per_tool(self):
+        rows = [
+            {"date": "2026-07-01", "tool_name": "a", "call_count": 1, "spend": 3.0, "total_tokens": 10},
+            {"date": "2026-07-01", "tool_name": "b", "call_count": 1, "spend": 3.0, "total_tokens": 10},
+        ]
+        resp = _build_tool_spend_response(rows, "2026-07-01", "2026-07-01")
+        by_tool = {t.tool_name: t.spend for t in resp.by_tool}
+        assert by_tool == {"a": 3.0, "b": 3.0}
+        assert resp.total_spend == 6.0
+
+    def test_skips_rows_without_tool_name(self):
+        rows = [
+            {"date": "2026-07-01", "tool_name": "", "call_count": 1, "spend": 9.0, "total_tokens": 1},
+            {"date": "2026-07-01", "tool_name": "a", "call_count": 1, "spend": 1.0, "total_tokens": 1},
+        ]
+        resp = _build_tool_spend_response(rows, None, None)
+        assert [t.tool_name for t in resp.by_tool] == ["a"]
+        assert resp.daily and all(d.tool_name == "a" for d in resp.daily)
