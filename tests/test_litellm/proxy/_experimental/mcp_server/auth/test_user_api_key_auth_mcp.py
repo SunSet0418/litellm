@@ -6485,11 +6485,12 @@ class TestUserSubjectTeamUnion:
     user-subject caller (the gateway DCR session bearer and bridge user-envelope), while a
     key-based caller keeps its single-team behavior byte-identically."""
 
-    def _team(self, team_id, mcp_servers):
-        from litellm.proxy._types import LiteLLM_ObjectPermissionTable, LiteLLM_TeamTable
+    def _team(self, team_id, mcp_servers, members=("sso-user",)):
+        from litellm.proxy._types import LiteLLM_ObjectPermissionTable, LiteLLM_TeamTable, Member
 
         return LiteLLM_TeamTable(
             team_id=team_id,
+            members_with_roles=[Member(user_id=u, role="user") for u in members],
             access_group_ids=[],
             object_permission=LiteLLM_ObjectPermissionTable(
                 object_permission_id=f"op-{team_id}", mcp_servers=mcp_servers
@@ -6612,10 +6613,11 @@ class TestUserSubjectTeamUnion:
         granting team restricts ``srv1`` to ``{tool_a}`` must NOT receive allow-all on srv1. The
         single-team-id tool lookup returns None (allow-all) for a keyless multi-team user, dropping
         the exclusion; the union across granting teams restores it."""
-        from litellm.proxy._types import LiteLLM_ObjectPermissionTable, LiteLLM_TeamTable
+        from litellm.proxy._types import LiteLLM_ObjectPermissionTable, LiteLLM_TeamTable, Member
 
         team = LiteLLM_TeamTable(
             team_id="team-a",
+            members_with_roles=[Member(user_id="sso-user", role="user")],
             access_group_ids=[],
             object_permission=LiteLLM_ObjectPermissionTable(
                 object_permission_id="op-team-a",
@@ -6632,11 +6634,12 @@ class TestUserSubjectTeamUnion:
         """Security regression: a blocked team grants nothing. The central policy gate enforces this
         for a key pinned to a single team_id, but a keyless admitted subject unions across ALL its
         teams (no team_id), so a blocked team's MCP grants must be dropped at the per-team resolver."""
-        from litellm.proxy._types import LiteLLM_ObjectPermissionTable, LiteLLM_TeamTable
+        from litellm.proxy._types import LiteLLM_ObjectPermissionTable, LiteLLM_TeamTable, Member
 
         blocked = LiteLLM_TeamTable(
             team_id="team-blocked",
             blocked=True,
+            members_with_roles=[Member(user_id="sso-user", role="user")],
             access_group_ids=[],
             object_permission=LiteLLM_ObjectPermissionTable(object_permission_id="op-blk", mcp_servers=["srv-secret"]),
         )
@@ -6649,12 +6652,13 @@ class TestUserSubjectTeamUnion:
     async def test_over_budget_team_grants_no_servers_to_admitted_subject(self):
         """A keyless admitted subject unions all its teams with no team_id, so the central gate never
         runs a team's budget check. An over-budget team must contribute no servers to the union."""
-        from litellm.proxy._types import LiteLLM_ObjectPermissionTable, LiteLLM_TeamTable
+        from litellm.proxy._types import LiteLLM_ObjectPermissionTable, LiteLLM_TeamTable, Member
 
         broke = LiteLLM_TeamTable(
             team_id="team-broke",
             max_budget=10.0,
             spend=25.0,
+            members_with_roles=[Member(user_id="sso-user", role="user")],
             access_group_ids=[],
             object_permission=LiteLLM_ObjectPermissionTable(object_permission_id="op-broke", mcp_servers=["srv-paid"]),
         )
@@ -6663,3 +6667,27 @@ class TestUserSubjectTeamUnion:
         with self._patch(teams_by_id=teams, user_teams=["team-ok", "team-broke"]):
             result = await MCPRequestHandler._get_allowed_mcp_servers_for_team(auth)
         assert set(result) == {"srv-ok"}
+
+    async def test_admitted_subject_not_on_team_roster_gets_no_grant(self):
+        """Security regression (membership containment): a keyless subject whose user_id is NOT on a
+        team's roster inherits nothing from it, even when the team id lingers in the user's (stale or
+        cached) teams array. The team roster is the source of truth, so a removed or foreign
+        membership revokes access at the union rather than granting it."""
+        teams = {"team-x": self._team("team-x", ["srv-x"], members=("someone-else",))}
+        auth = self._admitted_subject("sso-user")  # in user.teams for team-x, but NOT on its roster
+        with self._patch(teams_by_id=teams, user_teams=["team-x"]):
+            result = await MCPRequestHandler._get_allowed_mcp_servers_for_team(auth)
+        assert result == []
+
+    async def test_tool_resolution_fails_closed_on_db_error(self):
+        """Security regression: if resolving the multi-team tool allowlist errors (a DB blip during
+        the per-team fan-out), the admitted subject must be DENIED the server's tools ([]) rather
+        than collapsing to allow-all (None), mirroring the fail-closed server path."""
+        auth = self._admitted_subject("sso-user")
+        with patch.object(
+            MCPRequestHandler,
+            "_admitted_subject_team_tools",
+            new=AsyncMock(side_effect=RuntimeError("db blip")),
+        ):
+            tools = await MCPRequestHandler.get_allowed_tools_for_server("srv1", auth)
+        assert tools == []

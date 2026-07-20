@@ -1453,7 +1453,17 @@ class MCPRequestHandler:
             # per-server tool exclusions. Recompute the team restriction as the union across ALL
             # teams of theirs that grant the server, so a team's mcp_tool_permissions still bind.
             if _is_mcp_admitted_user_subject(user_api_key_auth):
-                team_tools = await MCPRequestHandler._admitted_subject_team_tools(server_id, user_api_key_auth)
+                try:
+                    team_tools = await MCPRequestHandler._admitted_subject_team_tools(server_id, user_api_key_auth)
+                except Exception as exc:
+                    # Fail CLOSED: resolving the tool allowlist across the subject's teams touches the
+                    # DB per team, so a transient failure must NOT collapse to the outer handler's
+                    # allow-all (None). Deny this server's tools for the request (the client retries),
+                    # mirroring the fail-closed server path (get_allowed_mcp_servers returns []).
+                    verbose_logger.debug(
+                        "admitted-subject tool resolution failed closed (%s)", type(exc).__name__
+                    )
+                    return []
 
             # Apply same inheritance logic as get_allowed_mcp_servers
             if team_tools:
@@ -1848,16 +1858,24 @@ class MCPRequestHandler:
                 # pinned to a single team_id, but a keyless admitted identity (no team_id) unions
                 # across all of its teams and would otherwise inherit a blocked team's MCP grants.
                 return []
-            if (
-                _is_mcp_admitted_user_subject(user_api_key_auth)
-                and team_obj.max_budget is not None
-                and (team_obj.spend or 0.0) >= team_obj.max_budget
-            ):
+            if _is_mcp_admitted_user_subject(user_api_key_auth):
                 # A keyless admitted subject unions ALL of its teams with no team_id, so the central
-                # gate (common_checks) never runs THIS team's budget check. Drop an over-budget
-                # team's grants here or the subject keeps reaching its servers past budget. Gated on
-                # the admission marker so key auth (whose single team the gate checks) is unchanged.
-                return []
+                # gate (common_checks) never runs THIS team's membership or budget check. Enforce
+                # them per unioned team, or the subject inherits grants the normal team-key path
+                # rejects. Gated on the admission marker so key auth (whose single team the gate
+                # already checks) stays byte-identical.
+                #
+                # Membership uses the team roster as the source of truth, NOT the user's cached
+                # `teams` array: a stale/foreign team_id (SCIM group sync, or cache lag after a
+                # team_member_delete that the user row hasn't caught up on) leaves the id in
+                # user.teams while the team's members_with_roles no longer contains the user, so the
+                # roster is what revokes access. get_team_object loads the full row (members_with_roles
+                # is a column), so an admitted member is present.
+                member_user_ids = {getattr(m, "user_id", None) for m in (team_obj.members_with_roles or [])}
+                if user_api_key_auth is None or user_api_key_auth.user_id not in member_user_ids:
+                    return []
+                if team_obj.max_budget is not None and (team_obj.spend or 0.0) >= team_obj.max_budget:
+                    return []
 
             team_access_group_servers = await _get_mcp_server_ids_from_access_groups(
                 access_group_ids=team_obj.access_group_ids or [],
