@@ -163,6 +163,10 @@ const UsageTab: React.FC<UsageTabProps> = ({ accessToken, userId, userRole }) =>
 
   const topTools = useMemo(() => topToolsBySpend(toolSpend?.by_tool ?? []), [toolSpend]);
   const topToolNames = useMemo(() => topTools.map((t) => t.tool_name), [topTools]);
+  const topToolsChart = useMemo<Record<string, string | number>[]>(
+    () => topTools.map((t) => ({ tool_name: t.tool_name, spend: t.spend })),
+    [topTools],
+  );
   const dailyToolSeries = useMemo(
     () =>
       buildDailyToolSeries(toolSpend?.daily ?? [], topToolNames).map((point) => ({
@@ -292,7 +296,7 @@ const UsageTab: React.FC<UsageTabProps> = ({ accessToken, userId, userRole }) =>
               <div>
                 <p className="mb-2 text-sm font-medium text-muted-foreground">Total by tool</p>
                 <BarChart
-                  data={topTools}
+                  data={topToolsChart}
                   index="tool_name"
                   categories={["spend"]}
                   colors={["emerald"]}

@@ -1,6 +1,7 @@
 import { render } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import type { KeyMetricWithMetadata } from "@/components/UsagePage/types";
+import type { ToolSpendResponse } from "@/components/networking";
 
 import type { DailyData, SpendMetrics } from "@/components/UsagePage/types";
 
@@ -37,7 +38,7 @@ vi.mock("@/components/shared/charts", () => ({
 
 import UsageTab from "./UsageTab";
 
-const emptyToolSpend = { by_tool: [], daily: [], total_spend: 0, start_date: null, end_date: null };
+const emptyToolSpend: ToolSpendResponse = { by_tool: [], daily: [], total_spend: 0, start_date: null, end_date: null };
 
 const baseMetrics = (overrides: Partial<SpendMetrics>): SpendMetrics => ({
   spend: 0,
