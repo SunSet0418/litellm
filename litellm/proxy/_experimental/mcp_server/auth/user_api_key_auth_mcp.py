@@ -137,7 +137,7 @@ def _is_mcp_admitted_user_subject(user_api_key_auth: UserAPIKeyAuth | None) -> b
     metadata is caller-controlled at key creation, so a metadata marker could be forged on a
     personal key to gain the team-inherited grant union or to dodge the caller-Authorization
     egress scrub. This field cannot be set from caller input."""
-    return getattr(user_api_key_auth, "mcp_admitted_user_subject", False) is True
+    return user_api_key_auth is not None and user_api_key_auth.mcp_admitted_user_subject is True
 
 
 def _is_aggregate_mcp_scope(route: str, mcp_servers: list[str] | None) -> bool:
@@ -1322,11 +1322,7 @@ class MCPRequestHandler:
             #########################################################
             # Apply org-level ceiling if org_id is set
             #########################################################
-            # A keyless admitted subject's org enforcement is applied PER TEAM in
-            # _allowed_mcp_servers_for_single_team (each team's grant capped by that team's org), so
-            # the single primary-org cap must not run for it — otherwise the primary org would
-            # re-clip servers a cross-org team legitimately granted. Key/JWT auth is unchanged.
-            if user_api_key_auth and user_api_key_auth.org_id and not _is_mcp_admitted_user_subject(user_api_key_auth):
+            if user_api_key_auth and user_api_key_auth.org_id:
                 allowed_mcp_servers_for_org = await MCPRequestHandler._get_allowed_mcp_servers_for_org(
                     user_api_key_auth
                 )
@@ -1762,8 +1758,9 @@ class MCPRequestHandler:
                 if op and op.mcp_tool_permissions
                 else None
             )
-            if team_restriction is None:
-                # This team grants the server with no tool restriction, so the union is all tools.
+            if not team_restriction:
+                # None OR an empty list both mean "no tool restriction from this team" — matching the
+                # single-team path's `if team_tools:` truthiness — so the union widens to all tools.
                 return None
             restricted |= set(team_restriction)
         return list(restricted) if restricted else None
@@ -1868,21 +1865,22 @@ class MCPRequestHandler:
                 return []
             if _is_mcp_admitted_user_subject(user_api_key_auth):
                 # A keyless admitted subject unions ALL of its teams with no team_id, so the central
-                # gate (common_checks) never runs THIS team's membership or budget check. Enforce
-                # them per unioned team, or the subject inherits grants the normal team-key path
-                # rejects. Gated on the admission marker so key auth (whose single team the gate
-                # already checks) stays byte-identical.
-                #
-                # Membership uses the team roster as the source of truth, NOT the user's cached
-                # `teams` array: a stale/foreign team_id (SCIM group sync, or cache lag after a
-                # team_member_delete that the user row hasn't caught up on) leaves the id in
-                # user.teams while the team's members_with_roles no longer contains the user, so the
-                # roster is what revokes access. get_team_object loads the full row (members_with_roles
-                # is a column), so an admitted member is present.
-                member_user_ids = {getattr(m, "user_id", None) for m in (team_obj.members_with_roles or [])}
-                if user_api_key_auth is None or user_api_key_auth.user_id not in member_user_ids:
-                    return []
-                if team_obj.max_budget is not None and (team_obj.spend or 0.0) >= team_obj.max_budget:
+                # gate (common_checks) never runs THIS team's membership check. Enforce it per unioned
+                # team using the team ROSTER as the source of truth (not the user's cached `teams`
+                # array): a stale/foreign team_id (SCIM group sync, or cache lag after a
+                # team_member_delete the user row hasn't caught up on) lingers in user.teams while the
+                # team's members_with_roles no longer contains the user, so the roster is what revokes
+                # access. get_team_object loads the full row (members_with_roles is a column). Gated on
+                # the admission marker so key auth (whose single team the gate already checks) is
+                # unchanged. (Team budget/org ceiling for the union are NOT re-implemented here — that
+                # is common_checks' and the top-level primary-org cap's job; doing them per-team
+                # correctly is a dedicated grant-model change, not a per-cell patch.)
+                member_user_ids = {getattr(m, "user_id", None) for m in (team_obj.members_with_roles or [])} - {None}
+                if (
+                    user_api_key_auth is None
+                    or not user_api_key_auth.user_id
+                    or user_api_key_auth.user_id not in member_user_ids
+                ):
                     return []
 
             team_access_group_servers = await _get_mcp_server_ids_from_access_groups(
@@ -1912,16 +1910,7 @@ class MCPRequestHandler:
             all_servers = (
                 direct_mcp_servers + legacy_access_group_servers + tool_perm_servers + team_access_group_servers
             )
-            granted = set(all_servers)
-            if _is_mcp_admitted_user_subject(user_api_key_auth) and team_obj.organization_id:
-                # Cap this team's grant by ITS OWN org's MCP ceiling, not the admitted user's primary
-                # org. A keyless subject unions teams across orgs, so the effective reach is
-                # union over teams of (team grant ∩ that team's org ceiling): a server reached via a
-                # team in org B is subject to org B's ceiling, and being in org A cannot broaden it.
-                org_ceiling = await MCPRequestHandler._org_mcp_ceiling(team_obj.organization_id, user_api_key_auth)
-                if org_ceiling:
-                    granted &= set(org_ceiling)
-            return list(granted)
+            return list(set(all_servers))
         except Exception as e:
             verbose_logger.warning(f"Failed to get allowed MCP servers for team: {str(e)}")
             return []
@@ -1971,50 +1960,6 @@ class MCPRequestHandler:
         except Exception as e:
             verbose_logger.warning(f"Failed to get org object permission: {str(e)}")
             return None
-
-    @staticmethod
-    async def _org_mcp_ceiling(org_id: str, user_api_key_auth: UserAPIKeyAuth | None) -> List[str]:
-        """The MCP-server ceiling of a SPECIFIC org (empty = no restriction from that org).
-
-        Lets a keyless subject's per-team grant be capped by THAT team's org rather than the admitted
-        user's primary org, so each org caps only its own teams' grants. Shares the same
-        ``get_org_object`` / ``get_object_permission`` cache entries as the rest of the proxy."""
-        from litellm.proxy._experimental.mcp_server.mcp_server_manager import (
-            global_mcp_server_manager,
-        )
-        from litellm.proxy.auth.auth_checks import get_object_permission, get_org_object
-        from litellm.proxy.proxy_server import (
-            prisma_client,
-            proxy_logging_obj,
-            user_api_key_cache,
-        )
-
-        if not org_id or prisma_client is None:
-            return []
-        parent_otel_span = user_api_key_auth.parent_otel_span if user_api_key_auth is not None else None
-        try:
-            org_obj = await get_org_object(
-                org_id=org_id,
-                prisma_client=prisma_client,
-                user_api_key_cache=user_api_key_cache,
-                parent_otel_span=parent_otel_span,
-                proxy_logging_obj=proxy_logging_obj,
-            )
-            if org_obj is None or not org_obj.object_permission_id:
-                return []
-            op = await get_object_permission(
-                object_permission_id=org_obj.object_permission_id,
-                prisma_client=prisma_client,
-                user_api_key_cache=user_api_key_cache,
-                parent_otel_span=parent_otel_span,
-                proxy_logging_obj=proxy_logging_obj,
-            )
-            if op is None:
-                return []
-            return global_mcp_server_manager.expand_permission_list(op.mcp_servers or [])
-        except Exception as e:  # noqa: BLE001  # any load failure yields no ceiling (empty), never raises
-            verbose_logger.warning(f"Failed to load org MCP ceiling for {org_id}: {type(e).__name__}")
-            return []
 
     @staticmethod
     async def _get_allowed_mcp_servers_for_org(

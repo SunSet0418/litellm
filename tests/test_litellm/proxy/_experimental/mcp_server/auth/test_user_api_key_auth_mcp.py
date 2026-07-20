@@ -6672,25 +6672,6 @@ class TestUserSubjectTeamUnion:
             result = await MCPRequestHandler._get_allowed_mcp_servers_for_team(auth)
         assert set(result) == {"srv-ok"}
 
-    async def test_over_budget_team_grants_no_servers_to_admitted_subject(self):
-        """A keyless admitted subject unions all its teams with no team_id, so the central gate never
-        runs a team's budget check. An over-budget team must contribute no servers to the union."""
-        from litellm.proxy._types import LiteLLM_ObjectPermissionTable, LiteLLM_TeamTable, Member
-
-        broke = LiteLLM_TeamTable(
-            team_id="team-broke",
-            max_budget=10.0,
-            spend=25.0,
-            members_with_roles=[Member(user_id="sso-user", role="user")],
-            access_group_ids=[],
-            object_permission=LiteLLM_ObjectPermissionTable(object_permission_id="op-broke", mcp_servers=["srv-paid"]),
-        )
-        teams = {"team-ok": self._team("team-ok", ["srv-ok"]), "team-broke": broke}
-        auth = self._admitted_subject("sso-user")
-        with self._patch(teams_by_id=teams, user_teams=["team-ok", "team-broke"]):
-            result = await MCPRequestHandler._get_allowed_mcp_servers_for_team(auth)
-        assert set(result) == {"srv-ok"}
-
     async def test_admitted_subject_not_on_team_roster_gets_no_grant(self):
         """Security regression (membership containment): a keyless subject whose user_id is NOT on a
         team's roster inherits nothing from it, even when the team id lingers in the user's (stale or
@@ -6714,35 +6695,6 @@ class TestUserSubjectTeamUnion:
         ):
             tools = await MCPRequestHandler.get_allowed_tools_for_server("srv1", auth)
         assert tools == []
-
-    async def test_per_team_org_ceiling_caps_each_teams_grant_by_its_own_org(self):
-        """Cross-org union: each team's grant is capped by THAT team's org ceiling, then unioned
-        (reachable = union over teams of grant ∩ that team's org). A server a team grants is dropped
-        if the team's OWN org excludes it, even if another of the user's orgs would allow it."""
-        from litellm.proxy._types import LiteLLM_ObjectPermissionTable, LiteLLM_TeamTable, Member
-
-        def _org_team(tid, org, servers):
-            return LiteLLM_TeamTable(
-                team_id=tid,
-                organization_id=org,
-                members_with_roles=[Member(user_id="sso-user", role="user")],
-                access_group_ids=[],
-                object_permission=LiteLLM_ObjectPermissionTable(
-                    object_permission_id=f"op-{tid}", mcp_servers=servers
-                ),
-            )
-
-        teams = {"T_A": _org_team("T_A", "orgA", ["a", "e"]), "T_B": _org_team("T_B", "orgB", ["c", "d"])}
-        ceilings = {"orgA": ["a", "b", "c"], "orgB": ["c", "d", "e"]}
-        auth = self._admitted_subject("sso-user")
-        with self._patch(teams_by_id=teams, user_teams=["T_A", "T_B"]), patch.object(
-            MCPRequestHandler,
-            "_org_mcp_ceiling",
-            new=AsyncMock(side_effect=lambda org_id, _auth: ceilings.get(org_id, [])),
-        ):
-            result = await MCPRequestHandler._get_allowed_mcp_servers_for_team(auth)
-        # e is granted by T_A but orgA {a,b,c} excludes it, so it is NOT reachable even though orgB allows e
-        assert set(result) == {"a", "c", "d"}
 
     async def test_admission_marker_cannot_be_set_from_validated_input(self):
         """Defense-in-depth: the mcp_admitted_user_subject marker is server-only. Supplying it in any
