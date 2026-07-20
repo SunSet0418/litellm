@@ -1314,7 +1314,15 @@ class MCPRequestHandler:
             #########################################################
             # Apply org-level ceiling if org_id is set
             #########################################################
-            if user_api_key_auth and user_api_key_auth.org_id:
+            # A keyless admitted subject's org enforcement is applied PER TEAM in
+            # _allowed_mcp_servers_for_single_team (each team's grant capped by that team's org), so
+            # the single primary-org cap must not run for it — otherwise the primary org would
+            # re-clip servers a cross-org team legitimately granted. Key/JWT auth is unchanged.
+            if (
+                user_api_key_auth
+                and user_api_key_auth.org_id
+                and not _is_mcp_admitted_user_subject(user_api_key_auth)
+            ):
                 allowed_mcp_servers_for_org = await MCPRequestHandler._get_allowed_mcp_servers_for_org(
                     user_api_key_auth
                 )
@@ -1904,7 +1912,16 @@ class MCPRequestHandler:
             all_servers = (
                 direct_mcp_servers + legacy_access_group_servers + tool_perm_servers + team_access_group_servers
             )
-            return list(set(all_servers))
+            granted = set(all_servers)
+            if _is_mcp_admitted_user_subject(user_api_key_auth) and team_obj.organization_id:
+                # Cap this team's grant by ITS OWN org's MCP ceiling, not the admitted user's primary
+                # org. A keyless subject unions teams across orgs, so the effective reach is
+                # union over teams of (team grant ∩ that team's org ceiling): a server reached via a
+                # team in org B is subject to org B's ceiling, and being in org A cannot broaden it.
+                org_ceiling = await MCPRequestHandler._org_mcp_ceiling(team_obj.organization_id, user_api_key_auth)
+                if org_ceiling:
+                    granted &= set(org_ceiling)
+            return list(granted)
         except Exception as e:
             verbose_logger.warning(f"Failed to get allowed MCP servers for team: {str(e)}")
             return []
@@ -1954,6 +1971,50 @@ class MCPRequestHandler:
         except Exception as e:
             verbose_logger.warning(f"Failed to get org object permission: {str(e)}")
             return None
+
+    @staticmethod
+    async def _org_mcp_ceiling(org_id: str, user_api_key_auth: Optional[UserAPIKeyAuth]) -> List[str]:
+        """The MCP-server ceiling of a SPECIFIC org (empty = no restriction from that org).
+
+        Lets a keyless subject's per-team grant be capped by THAT team's org rather than the admitted
+        user's primary org, so each org caps only its own teams' grants. Shares the same
+        ``get_org_object`` / ``get_object_permission`` cache entries as the rest of the proxy."""
+        from litellm.proxy._experimental.mcp_server.mcp_server_manager import (
+            global_mcp_server_manager,
+        )
+        from litellm.proxy.auth.auth_checks import get_object_permission, get_org_object
+        from litellm.proxy.proxy_server import (
+            prisma_client,
+            proxy_logging_obj,
+            user_api_key_cache,
+        )
+
+        if not org_id or prisma_client is None:
+            return []
+        parent_otel_span = user_api_key_auth.parent_otel_span if user_api_key_auth is not None else None
+        try:
+            org_obj = await get_org_object(
+                org_id=org_id,
+                prisma_client=prisma_client,
+                user_api_key_cache=user_api_key_cache,
+                parent_otel_span=parent_otel_span,
+                proxy_logging_obj=proxy_logging_obj,
+            )
+            if org_obj is None or not org_obj.object_permission_id:
+                return []
+            op = await get_object_permission(
+                object_permission_id=org_obj.object_permission_id,
+                prisma_client=prisma_client,
+                user_api_key_cache=user_api_key_cache,
+                parent_otel_span=parent_otel_span,
+                proxy_logging_obj=proxy_logging_obj,
+            )
+            if op is None:
+                return []
+            return global_mcp_server_manager.expand_permission_list(op.mcp_servers or [])
+        except Exception as e:
+            verbose_logger.warning(f"Failed to load org MCP ceiling for {org_id}: {type(e).__name__}")
+            return []
 
     @staticmethod
     async def _get_allowed_mcp_servers_for_org(
