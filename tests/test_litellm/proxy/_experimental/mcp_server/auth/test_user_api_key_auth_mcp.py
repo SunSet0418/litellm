@@ -6328,7 +6328,7 @@ class TestGatewaySessionAdmission:
 
     @staticmethod
     @contextlib.contextmanager
-    def _patch_user_reload(*, user_id, active=True, organization_id=None):
+    def _patch_user_reload(*, user_id, active=True, organization_id=None, tpm_limit=None, rpm_limit=None):
         get_user_object = AsyncMock(
             return_value=MagicMock(
                 user_id=user_id,
@@ -6337,6 +6337,8 @@ class TestGatewaySessionAdmission:
                 user_role=None,
                 object_permission=None,
                 object_permission_id=None,
+                tpm_limit=tpm_limit,
+                rpm_limit=rpm_limit,
             )
         )
         with (
@@ -6360,6 +6362,24 @@ class TestGatewaySessionAdmission:
         ):
             auth_result, *_rest = await MCPRequestHandler.process_mcp_request(self._scope(token))
         assert auth_result.org_id == "org-123"
+
+    async def test_session_admission_copies_user_rate_limits(self):
+        """Security regression: the reconstructed auth must carry the live user's RPM/TPM, exactly as
+        the standard user-subject path does. The parallel limiter reads these off the auth object and
+        treats None as unlimited, so a keyless subject with them unset would invoke tools past their
+        configured user rate limits."""
+        token = self._access_token(user_id="rl-user")
+        with (
+            patch("litellm.proxy.proxy_server.master_key", self._MASTER_KEY),
+            patch(
+                "litellm.proxy._experimental.mcp_server.auth.user_api_key_auth_mcp.user_api_key_auth",
+                new_callable=AsyncMock,
+            ),
+            self._patch_user_reload(user_id="rl-user", tpm_limit=1000, rpm_limit=50),
+        ):
+            auth_result, *_rest = await MCPRequestHandler.process_mcp_request(self._scope(token))
+        assert auth_result.user_tpm_limit == 1000
+        assert auth_result.user_rpm_limit == 50
 
     async def test_valid_session_admits_under_live_user_at_aggregate_scope(self):
         token = self._access_token(user_id="sso-user-42")

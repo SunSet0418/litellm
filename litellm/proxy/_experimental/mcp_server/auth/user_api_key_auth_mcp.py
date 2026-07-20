@@ -846,6 +846,12 @@ class MCPRequestHandler:
             org_id=user_object.organization_id,
             object_permission=object_permission,
             object_permission_id=user_object.object_permission_id,
+            # Copy the live user's rate limits, exactly as the standard user-subject auth path does
+            # (user_api_key_auth.py). The parallel limiter reads these off the auth object rather than
+            # re-fetching, and treats None as sys.maxsize (unlimited), so a keyless admitted user with
+            # them unset would invoke tools past their configured user RPM/TPM.
+            user_tpm_limit=user_object.tpm_limit,
+            user_rpm_limit=user_object.rpm_limit,
         )
         # Set the server-only admission marker AFTER construction: the before-validator strips it
         # from any validated input, so a post-construction assignment is the only way to set it, and
