@@ -6627,3 +6627,39 @@ class TestUserSubjectTeamUnion:
         with self._patch(teams_by_id={"team-a": team}, user_teams=["team-a"]):
             tools = await MCPRequestHandler.get_allowed_tools_for_server("srv1", auth)
         assert tools == ["tool_a"]
+
+    async def test_blocked_team_grants_no_servers_to_admitted_subject(self):
+        """Security regression: a blocked team grants nothing. The central policy gate enforces this
+        for a key pinned to a single team_id, but a keyless admitted subject unions across ALL its
+        teams (no team_id), so a blocked team's MCP grants must be dropped at the per-team resolver."""
+        from litellm.proxy._types import LiteLLM_ObjectPermissionTable, LiteLLM_TeamTable
+
+        blocked = LiteLLM_TeamTable(
+            team_id="team-blocked",
+            blocked=True,
+            access_group_ids=[],
+            object_permission=LiteLLM_ObjectPermissionTable(object_permission_id="op-blk", mcp_servers=["srv-secret"]),
+        )
+        teams = {"team-ok": self._team("team-ok", ["srv-ok"]), "team-blocked": blocked}
+        auth = self._admitted_subject("sso-user")
+        with self._patch(teams_by_id=teams, user_teams=["team-ok", "team-blocked"]):
+            result = await MCPRequestHandler._get_allowed_mcp_servers_for_team(auth)
+        assert set(result) == {"srv-ok"}
+
+    async def test_over_budget_team_grants_no_servers_to_admitted_subject(self):
+        """A keyless admitted subject unions all its teams with no team_id, so the central gate never
+        runs a team's budget check. An over-budget team must contribute no servers to the union."""
+        from litellm.proxy._types import LiteLLM_ObjectPermissionTable, LiteLLM_TeamTable
+
+        broke = LiteLLM_TeamTable(
+            team_id="team-broke",
+            max_budget=10.0,
+            spend=25.0,
+            access_group_ids=[],
+            object_permission=LiteLLM_ObjectPermissionTable(object_permission_id="op-broke", mcp_servers=["srv-paid"]),
+        )
+        teams = {"team-ok": self._team("team-ok", ["srv-ok"]), "team-broke": broke}
+        auth = self._admitted_subject("sso-user")
+        with self._patch(teams_by_id=teams, user_teams=["team-ok", "team-broke"]):
+            result = await MCPRequestHandler._get_allowed_mcp_servers_for_team(auth)
+        assert set(result) == {"srv-ok"}

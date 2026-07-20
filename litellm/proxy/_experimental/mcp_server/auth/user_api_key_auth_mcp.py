@@ -1843,6 +1843,21 @@ class MCPRequestHandler:
             )
             if team_obj is None:
                 return []
+            if team_obj.blocked:
+                # A blocked team grants nothing. The central policy gate enforces this for a key
+                # pinned to a single team_id, but a keyless admitted identity (no team_id) unions
+                # across all of its teams and would otherwise inherit a blocked team's MCP grants.
+                return []
+            if (
+                _is_mcp_admitted_user_subject(user_api_key_auth)
+                and team_obj.max_budget is not None
+                and (team_obj.spend or 0.0) >= team_obj.max_budget
+            ):
+                # A keyless admitted subject unions ALL of its teams with no team_id, so the central
+                # gate (common_checks) never runs THIS team's budget check. Drop an over-budget
+                # team's grants here or the subject keeps reaching its servers past budget. Gated on
+                # the admission marker so key auth (whose single team the gate checks) is unchanged.
+                return []
 
             team_access_group_servers = await _get_mcp_server_ids_from_access_groups(
                 access_group_ids=team_obj.access_group_ids or [],

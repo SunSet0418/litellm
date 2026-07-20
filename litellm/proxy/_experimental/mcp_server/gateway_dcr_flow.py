@@ -63,6 +63,7 @@ from litellm.proxy._experimental.mcp_server.outbound_credentials.session_credent
     session_keys_from_master_key,
 )
 from litellm.proxy._experimental.mcp_server.outbound_credentials.session_token import (
+    SESSION_REFRESH_TTL_SECONDS,
     MintedSessionToken,
     SessionKeys,
     SessionPrincipal,
@@ -94,6 +95,7 @@ GATEWAY_AUTH_CODE_TTL_SECONDS = 120
 _CLAIM_TTL_BUFFER_SECONDS = 60
 _USED_CODE_CACHE_PREFIX = "mcp_gateway_dcr_code_used:"
 _USED_FLOW_CACHE_PREFIX = "mcp_gateway_dcr_flow_used:"
+_USED_REFRESH_CACHE_PREFIX = "mcp_gateway_dcr_refresh_used:"
 
 MAX_REDIRECT_URIS = 3
 MAX_REDIRECT_URI_LENGTH = 256
@@ -521,6 +523,7 @@ async def aggregate_token(
             keys=keys,
             now=now,
             reload_user=reload_user,
+            guard=_SingleUseGuard(cache),
         )
     return _oauth_error(400, "unsupported_grant_type", "grant_type must be authorization_code or refresh_token")
 
@@ -568,6 +571,7 @@ async def _refresh_token_grant(
     keys: SessionKeys,
     now: datetime,
     reload_user: ReloadUser,
+    guard: _SingleUseGuard,
 ) -> Response:
     if not refresh_token:
         return _oauth_error(400, "invalid_request", "refresh_token is required")
@@ -577,4 +581,13 @@ async def _refresh_token_grant(
     failure = await reload_user(opened.principal.user_id)
     if failure is not None:
         return _reload_failure_response(failure)
+    # Refresh-token rotation (OAuth 2.0 Security BCP section 4.13): the presented refresh token is
+    # single-use. Claim its jti before issuing the replacement pair, so a captured or replayed
+    # refresh token cannot mint a second pair after the legitimate holder rotated. Claimed AFTER
+    # user revalidation so a transient DB 503 does not burn a still-valid token; a claim that
+    # cannot be recorded fails closed, exactly like the authorization-code path.
+    if not await guard.claim(
+        f"{_USED_REFRESH_CACHE_PREFIX}{opened.jti}", SESSION_REFRESH_TTL_SECONDS + _CLAIM_TTL_BUFFER_SECONDS
+    ):
+        return _oauth_error(400, "invalid_grant", "the refresh token was already used")
     return _session_token_pair(opened.principal, keys, now)

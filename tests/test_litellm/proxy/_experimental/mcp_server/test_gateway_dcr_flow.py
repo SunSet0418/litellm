@@ -263,6 +263,12 @@ async def test_full_walk_register_authorize_complete_token_and_replay():
     rotated = json.loads(refreshed.body)
     assert rotated["refresh_token"] != payload["refresh_token"]
 
+    # Rotation is single-use: replaying the now-consumed refresh token cannot mint a second pair
+    # (a captured token is dead once the legitimate holder has rotated).
+    replayed = await _token(grant_type="refresh_token", code=None, refresh_token=payload["refresh_token"])
+    assert json.loads(replayed.body)["error"] == "invalid_grant"
+    assert "already used" in json.loads(replayed.body).get("error_description", "")
+
     cross_client = await _token(
         grant_type="refresh_token",
         code=None,
