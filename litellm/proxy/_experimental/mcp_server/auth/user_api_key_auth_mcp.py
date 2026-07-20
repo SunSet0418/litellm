@@ -128,7 +128,7 @@ def _has_client_supplied_mcp_auth(
     return bool(mcp_auth_header) or bool(mcp_server_auth_headers)
 
 
-def _is_mcp_admitted_user_subject(user_api_key_auth: Optional[UserAPIKeyAuth]) -> bool:
+def _is_mcp_admitted_user_subject(user_api_key_auth: UserAPIKeyAuth | None) -> bool:
     """True when this auth is a keyless subject admitted by the gateway session / bridge user
     path, as opposed to a JWT or other keyless auth that merely lacks a ``team_id``.
 
@@ -1461,7 +1461,7 @@ class MCPRequestHandler:
             if _is_mcp_admitted_user_subject(user_api_key_auth):
                 try:
                     team_tools = await MCPRequestHandler._admitted_subject_team_tools(server_id, user_api_key_auth)
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001  # any transient error must fail closed, not allow-all
                     # Fail CLOSED: resolving the tool allowlist across the subject's teams touches the
                     # DB per team, so a transient failure must NOT collapse to the outer handler's
                     # allow-all (None). Deny this server's tools for the request (the client retries),
@@ -1716,7 +1716,7 @@ class MCPRequestHandler:
         return list({server for servers in per_team for server in servers})
 
     @staticmethod
-    async def _admitted_subject_team_tools(server_id: str, user_api_key_auth: UserAPIKeyAuth) -> Optional[List[str]]:
+    async def _admitted_subject_team_tools(server_id: str, user_api_key_auth: UserAPIKeyAuth) -> List[str] | None:
         """Effective team tool-allowlist for ``server_id`` for a keyless admitted subject, unioned
         across every team of theirs that grants the server.
 
@@ -1967,7 +1967,7 @@ class MCPRequestHandler:
             return None
 
     @staticmethod
-    async def _org_mcp_ceiling(org_id: str, user_api_key_auth: Optional[UserAPIKeyAuth]) -> List[str]:
+    async def _org_mcp_ceiling(org_id: str, user_api_key_auth: UserAPIKeyAuth | None) -> List[str]:
         """The MCP-server ceiling of a SPECIFIC org (empty = no restriction from that org).
 
         Lets a keyless subject's per-team grant be capped by THAT team's org rather than the admitted
@@ -2006,7 +2006,7 @@ class MCPRequestHandler:
             if op is None:
                 return []
             return global_mcp_server_manager.expand_permission_list(op.mcp_servers or [])
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  # any load failure yields no ceiling (empty), never raises
             verbose_logger.warning(f"Failed to load org MCP ceiling for {org_id}: {type(e).__name__}")
             return []
 
