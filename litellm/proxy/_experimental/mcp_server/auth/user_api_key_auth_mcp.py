@@ -1461,15 +1461,7 @@ class MCPRequestHandler:
             # per-server tool exclusions. Recompute the team restriction as the union across ALL
             # teams of theirs that grant the server, so a team's mcp_tool_permissions still bind.
             if _is_mcp_admitted_user_subject(user_api_key_auth):
-                try:
-                    team_tools = await MCPRequestHandler._admitted_subject_team_tools(server_id, user_api_key_auth)
-                except Exception as exc:  # noqa: BLE001  # any transient error must fail closed, not allow-all
-                    # Fail CLOSED: resolving the tool allowlist across the subject's teams touches the
-                    # DB per team, so a transient failure must NOT collapse to the outer handler's
-                    # allow-all (None). Deny this server's tools for the request (the client retries),
-                    # mirroring the fail-closed server path (get_allowed_mcp_servers returns []).
-                    verbose_logger.debug("admitted-subject tool resolution failed closed (%s)", type(exc).__name__)
-                    return []
+                team_tools = await MCPRequestHandler._admitted_subject_team_tools(server_id, user_api_key_auth)
 
             # Apply same inheritance logic as get_allowed_mcp_servers
             if team_tools:
@@ -1518,7 +1510,11 @@ class MCPRequestHandler:
 
         except Exception as e:
             verbose_logger.warning(f"Failed to get allowed tools for server: {str(e)}")
-            return None
+            # Fail CLOSED for a keyless admitted subject: ANY error resolving the tool allowlist
+            # (multi-team fan-out, org/agent lookups) must deny the server's tools ([]) for this
+            # request rather than collapse to allow-all (None), mirroring the fail-closed server
+            # path. Key/JWT auth keeps its prior allow-all-on-error behavior.
+            return [] if _is_mcp_admitted_user_subject(user_api_key_auth) else None
 
     @staticmethod
     async def is_tool_allowed_for_server(

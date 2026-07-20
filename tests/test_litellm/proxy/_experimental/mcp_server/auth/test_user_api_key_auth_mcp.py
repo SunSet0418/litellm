@@ -6684,13 +6684,14 @@ class TestUserSubjectTeamUnion:
         assert result == []
 
     async def test_tool_resolution_fails_closed_on_db_error(self):
-        """Security regression: if resolving the multi-team tool allowlist errors (a DB blip during
-        the per-team fan-out), the admitted subject must be DENIED the server's tools ([]) rather
-        than collapsing to allow-all (None), mirroring the fail-closed server path."""
+        """Security regression: ANY error resolving the tool allowlist for a keyless admitted subject
+        must DENY the server's tools ([]) rather than collapse to allow-all (None). Patches an await
+        OUTSIDE the multi-team fan-out (the team-object lookup) to prove the whole function fails
+        closed, not just the one helper — mirroring the fail-closed server path."""
         auth = self._admitted_subject("sso-user")
         with patch.object(
             MCPRequestHandler,
-            "_admitted_subject_team_tools",
+            "_get_team_object_permission",
             new=AsyncMock(side_effect=RuntimeError("db blip")),
         ):
             tools = await MCPRequestHandler.get_allowed_tools_for_server("srv1", auth)
