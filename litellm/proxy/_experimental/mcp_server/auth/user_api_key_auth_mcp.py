@@ -128,19 +128,16 @@ def _has_client_supplied_mcp_auth(
     return bool(mcp_auth_header) or bool(mcp_server_auth_headers)
 
 
-MCP_ADMITTED_USER_SUBJECT_METADATA = "mcp_admitted_user_subject"
-"""Marker key stamped into ``UserAPIKeyAuth.metadata`` by ``_reload_admitted_user`` for a
-subject admitted keyless through the gateway session / bridge user path. It is what lets
-``_team_ids_for_mcp_grant`` union the user's teams for exactly those admissions without also
-broadening JWT auth, which produces a structurally identical keyless auth."""
-
-
-def _is_mcp_admitted_user_subject(user_api_key_auth: UserAPIKeyAuth) -> bool:
+def _is_mcp_admitted_user_subject(user_api_key_auth: Optional[UserAPIKeyAuth]) -> bool:
     """True when this auth is a keyless subject admitted by the gateway session / bridge user
-    path (stamped at admission), as opposed to a JWT or other keyless auth that merely lacks a
-    ``team_id``."""
-    metadata = user_api_key_auth.metadata
-    return isinstance(metadata, dict) and metadata.get(MCP_ADMITTED_USER_SUBJECT_METADATA) is True
+    path, as opposed to a JWT or other keyless auth that merely lacks a ``team_id``.
+
+    Reads the server-only ``UserAPIKeyAuth.mcp_admitted_user_subject`` field, set exclusively by
+    ``_reload_admitted_user`` at admission. It is deliberately NOT a ``metadata`` key: virtual-key
+    metadata is caller-controlled at key creation, so a metadata marker could be forged on a
+    personal key to gain the team-inherited grant union or to dodge the caller-Authorization
+    egress scrub. This field cannot be set from caller input."""
+    return getattr(user_api_key_auth, "mcp_admitted_user_subject", False) is True
 
 
 def _is_aggregate_mcp_scope(route: str, mcp_servers: list[str] | None) -> bool:
@@ -435,13 +432,24 @@ class MCPRequestHandler:
                     bearer_presented=False,
                 )
 
+        # Leak-defense (single chokepoint): a keyless-admitted litellm subject's Authorization is
+        # the gateway session bearer / bridge envelope, an admission credential, NOT an upstream
+        # token. Scrub it from every egress header context so no client-forwarded, OBO-subject, or
+        # passthrough path can send it upstream, where a hostile server could capture and replay it
+        # against the aggregate endpoint as this user. Per-server credentials are unaffected: they
+        # are vaulted per-user and resolved at egress, never carried on the caller header.
+        raw_headers = dict(headers)
+        if _is_mcp_admitted_user_subject(validated_user_api_key_auth):
+            oauth2_headers = None
+            raw_headers = {k: v for k, v in raw_headers.items() if k.lower() != "authorization"}
+
         return (
             validated_user_api_key_auth,
             mcp_auth_header,
             mcp_servers,
             mcp_server_auth_headers,
             oauth2_headers,
-            dict(headers),
+            raw_headers,
         )
 
     @staticmethod
@@ -710,8 +718,20 @@ class MCPRequestHandler:
         result = resolve_session_bearer(authorization_value, keys, datetime.now(timezone.utc))
         match result:
             case SessionBearerAdmitted():
-                admitted = await MCPRequestHandler._reload_admitted_user(result.principal.user_id)
-                await MCPRequestHandler._enforce_admitted_live_policy(admitted=admitted, request=request, route=route)
+                try:
+                    admitted = await MCPRequestHandler._reload_admitted_user(result.principal.user_id)
+                    await MCPRequestHandler._enforce_admitted_live_policy(
+                        admitted=admitted, request=request, route=route
+                    )
+                except HTTPException as exc:
+                    # A cryptographically valid bearer whose referenced user is now missing or
+                    # SCIM-deactivated is an invalid_token at the aggregate scope: relay the RFC 9728
+                    # challenge so the DCR client re-authorizes, matching the SessionBearerInvalid
+                    # arm, instead of a bare 401 with no WWW-Authenticate. A 503 (DB outage) is a
+                    # transient availability failure, not an auth failure, so it passes through.
+                    if exc.status_code == 401:
+                        raise _aggregate_gateway_dcr_challenge(request, invalid_token=True) from exc
+                    raise
                 return admitted
             case SessionBearerInvalid():
                 raise _aggregate_gateway_dcr_challenge(request, invalid_token=True)
@@ -826,7 +846,7 @@ class MCPRequestHandler:
             org_id=user_object.organization_id,
             object_permission=object_permission,
             object_permission_id=user_object.object_permission_id,
-            metadata={MCP_ADMITTED_USER_SUBJECT_METADATA: True},
+            mcp_admitted_user_subject=True,
         )
 
     @staticmethod
@@ -1226,8 +1246,16 @@ class MCPRequestHandler:
                 # team's by default. With require_key_mcp_access_defined the
                 # team is a ceiling rather than a default, so the key must
                 # grant servers explicitly (or via an access group) to reach
-                # any — it inherits none.
-                base = set() if general_settings.get("require_key_mcp_access_defined", False) else team_set
+                # any — it inherits none. That ceiling is for VIRTUAL KEYS that
+                # can declare their own access; a keyless gateway/bridge-admitted
+                # user has no key to declare access on — team membership IS their
+                # only access path — so the flag must not zero their team grants.
+                require_key_access = general_settings.get("require_key_mcp_access_defined", False)
+                base = (
+                    team_set
+                    if (not require_key_access or _is_mcp_admitted_user_subject(user_api_key_auth))
+                    else set()
+                )
             else:
                 base = key_set & team_set  # both restrict → intersect
 
@@ -1419,6 +1447,13 @@ class MCPRequestHandler:
                 if team_obj_perm
                 else None
             )
+
+            # A keyless gateway/bridge-admitted user has no single team_id, so team_obj_perm above
+            # is None and the single-team lookup yields allow-all — silently dropping every team's
+            # per-server tool exclusions. Recompute the team restriction as the union across ALL
+            # teams of theirs that grant the server, so a team's mcp_tool_permissions still bind.
+            if _is_mcp_admitted_user_subject(user_api_key_auth):
+                team_tools = await MCPRequestHandler._admitted_subject_team_tools(server_id, user_api_key_auth)
 
             # Apply same inheritance logic as get_allowed_mcp_servers
             if team_tools:
@@ -1667,14 +1702,63 @@ class MCPRequestHandler:
         return list({server for servers in per_team for server in servers})
 
     @staticmethod
+    async def _admitted_subject_team_tools(
+        server_id: str, user_api_key_auth: UserAPIKeyAuth
+    ) -> Optional[List[str]]:
+        """Effective team tool-allowlist for ``server_id`` for a keyless admitted subject, unioned
+        across every team of theirs that grants the server.
+
+        A keyless gateway/bridge-admitted user has no single ``team_id``, so the standard
+        single-team tool lookup returns None (allow-all) and drops team tool exclusions. Access is
+        the union of the user's teams' grants, so: return None (no restriction) when a granting team
+        places no tool restriction on the server, otherwise the union of the granting teams' explicit
+        tool allowlists."""
+        from litellm.proxy._experimental.mcp_server.mcp_server_manager import (
+            global_mcp_server_manager,
+        )
+        from litellm.proxy.auth.auth_checks import get_team_object
+        from litellm.proxy.proxy_server import (
+            prisma_client,
+            proxy_logging_obj,
+            user_api_key_cache,
+        )
+
+        if prisma_client is None:
+            return None
+        team_ids = await MCPRequestHandler._team_ids_for_mcp_grant(user_api_key_auth)
+        restricted: set[str] = set()
+        for team_id in team_ids:
+            granted = set(await MCPRequestHandler._allowed_mcp_servers_for_single_team(team_id, user_api_key_auth))
+            if server_id not in granted:
+                continue
+            team_obj = await get_team_object(
+                team_id=team_id,
+                prisma_client=prisma_client,
+                user_api_key_cache=user_api_key_cache,
+                parent_otel_span=user_api_key_auth.parent_otel_span,
+                proxy_logging_obj=proxy_logging_obj,
+            )
+            op = team_obj.object_permission if team_obj else None
+            team_restriction = (
+                global_mcp_server_manager.expand_tool_permissions(op.mcp_tool_permissions).get(server_id)
+                if op and op.mcp_tool_permissions
+                else None
+            )
+            if team_restriction is None:
+                # This team grants the server with no tool restriction, so the union is all tools.
+                return None
+            restricted |= set(team_restriction)
+        return list(restricted) if restricted else None
+
+    @staticmethod
     async def _team_ids_for_mcp_grant(user_api_key_auth: UserAPIKeyAuth | None) -> list[str]:
         """The team ids whose MCP grants a caller inherits.
 
         A caller with an explicit ``team_id`` (every key-based caller, and any auth that pins
         a team) uses that single team, so key auth is byte-identical. The fan-out to the
         user's full team list happens ONLY for a subject admitted keyless through the gateway
-        session or bridge user path, which ``_reload_admitted_user`` stamps with
-        ``MCP_ADMITTED_USER_SUBJECT_METADATA``. Gating on that positive marker rather than on
+        session or bridge user path, which ``_reload_admitted_user`` stamps with the server-only
+        ``mcp_admitted_user_subject`` field. Gating on that un-forgeable marker rather than on
         ``api_key is None`` is deliberate: JWT auth also produces a keyless ``user_id`` auth
         with no ``team_id``, and it must keep its prior behavior (no team-inherited grants)
         rather than silently gaining the union across every team the user belongs to. The

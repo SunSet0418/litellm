@@ -1,7 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { render, screen } from "@testing-library/react";
 import ConnectFlowBanner from "./ConnectFlowBanner";
-import { PERSERVER_CONNECTING_KEY } from "@/hooks/mcpOAuthUtils";
 
 vi.mock("@/components/networking", () => ({
   getProxyBaseUrl: () => "https://gateway.example.com",
@@ -37,38 +36,14 @@ describe("ConnectFlowBanner", () => {
     expect(screen.getAllByText(/the application/).length).toBeGreaterThan(0);
   });
 
-  it("best-effort auto-finishes on pagehide (closing the tab)", () => {
+  it("does NOT complete the flow on pagehide (completion requires the explicit button)", () => {
+    // Security regression: an attacker could lure a signed-in victim to their own client's
+    // authorize URL; the victim merely closing the tab must NOT deliver a victim-bound code.
+    // Completion is a deliberate button press, never a side effect of leaving the page.
     const beaconMock = vi.fn(() => true);
     vi.stubGlobal("navigator", { ...navigator, sendBeacon: beaconMock });
     render(<ConnectFlowBanner flowHandle="flow-xyz" clientOrigin="https://claude.ai" />);
 
-    window.dispatchEvent(new Event("pagehide"));
-
-    expect(beaconMock).toHaveBeenCalledTimes(1);
-    const [url, body] = beaconMock.mock.calls[0] as unknown as [string, URLSearchParams];
-    expect(url).toBe("https://gateway.example.com/authorize/complete");
-    expect(body.toString()).toContain("flow=flow-xyz");
-  });
-
-  it("does NOT auto-finish while a per-server connect is navigating away", () => {
-    const beaconMock = vi.fn(() => true);
-    vi.stubGlobal("navigator", { ...navigator, sendBeacon: beaconMock });
-    render(<ConnectFlowBanner flowHandle="flow-xyz" clientOrigin="https://claude.ai" />);
-
-    // the per-server connect flow sets this right before it navigates to the upstream IdP
-    sessionStorage.setItem(PERSERVER_CONNECTING_KEY, "1");
-    window.dispatchEvent(new Event("pagehide"));
-
-    expect(beaconMock).not.toHaveBeenCalled();
-  });
-
-  it("does NOT double-fire the auto-finish after the button was pressed", () => {
-    const beaconMock = vi.fn(() => true);
-    vi.stubGlobal("navigator", { ...navigator, sendBeacon: beaconMock });
-    const { container } = render(<ConnectFlowBanner flowHandle="flow-xyz" clientOrigin="https://claude.ai" />);
-
-    // jsdom does not submit forms; fire the form's submit so onSubmit marks it finished
-    fireEvent.submit(container.querySelector("form")!);
     window.dispatchEvent(new Event("pagehide"));
 
     expect(beaconMock).not.toHaveBeenCalled();

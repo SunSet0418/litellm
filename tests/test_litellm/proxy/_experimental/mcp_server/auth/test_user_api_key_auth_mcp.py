@@ -15,6 +15,7 @@ from starlette.datastructures import Headers
 
 from litellm.proxy._experimental.mcp_server.auth.user_api_key_auth_mcp import (
     MCPRequestHandler,
+    _is_mcp_admitted_user_subject,
 )
 from litellm.proxy._types import (
     LiteLLM_ObjectPermissionTable,
@@ -205,6 +206,28 @@ class TestMCPRequestHandler:
             result = await MCPRequestHandler.get_allowed_mcp_servers(auth)
 
         assert sorted(result) == sorted(expected)
+
+    async def test_admitted_subject_not_zeroed_by_require_key_mcp_access_defined(self):
+        """10x-flow regression: with require_key_mcp_access_defined ON (team = ceiling for keys), a
+        keyless gateway/bridge-admitted subject whose ONLY access path is team membership must still
+        inherit the team's servers. The flag zeros empty *virtual keys* that must declare their own
+        access; a keyless admitted user has no key to declare it on, so it must not be zeroed."""
+        auth = UserAPIKeyAuth(api_key=None, user_id="sso-user", mcp_admitted_user_subject=True)
+        with (
+            patch.object(MCPRequestHandler, "_get_allowed_mcp_servers_for_key", new_callable=AsyncMock, return_value=[]),
+            patch.object(
+                MCPRequestHandler,
+                "_get_allowed_mcp_servers_for_team",
+                new_callable=AsyncMock,
+                return_value=["team_server1", "team_server2"],
+            ),
+            patch.object(
+                MCPRequestHandler, "_get_key_access_group_mcp_server_extras", new_callable=AsyncMock, return_value=[]
+            ),
+            patch("litellm.proxy.proxy_server.general_settings", {"require_key_mcp_access_defined": True}),
+        ):
+            result = await MCPRequestHandler.get_allowed_mcp_servers(auth)
+        assert sorted(result) == ["team_server1", "team_server2"]
 
     @pytest.mark.parametrize(
         "key_servers,grants,expected,scenario",
@@ -6380,6 +6403,44 @@ class TestGatewaySessionAdmission:
                 await MCPRequestHandler.process_mcp_request(self._scope(tampered))
         assert exc_info.value.status_code == 401
 
+    async def test_deactivated_user_fails_with_invalid_token_challenge(self):
+        """A cryptographically valid bearer whose referenced user is SCIM-deactivated must fail with
+        the aggregate invalid_token challenge (WWW-Authenticate), matching the expired/tampered arms,
+        so the DCR client re-authorizes instead of getting a bare 401 with no challenge."""
+        token = self._access_token(user_id="offboarded-user")
+        with (
+            patch("litellm.proxy.proxy_server.master_key", self._MASTER_KEY),
+            patch(
+                "litellm.proxy._experimental.mcp_server.auth.user_api_key_auth_mcp.user_api_key_auth",
+                new_callable=AsyncMock,
+            ),
+            self._patch_user_reload(user_id="offboarded-user", active=False),
+        ):
+            with pytest.raises(HTTPException) as exc_info:
+                await MCPRequestHandler.process_mcp_request(self._scope(token))
+        assert exc_info.value.status_code == 401
+        assert 'error="invalid_token"' in (exc_info.value.headers or {})["WWW-Authenticate"]
+
+    async def test_session_bearer_scrubbed_from_egress_header_contexts(self):
+        """Security regression (credential leak): after a keyless session admission, the session
+        bearer must be removed from BOTH returned egress header contexts (oauth2_headers and the raw
+        headers) so no passthrough/OBO egress can forward it upstream for replay as this user."""
+        token = self._access_token(user_id="sso-user-42")
+        with (
+            patch("litellm.proxy.proxy_server.master_key", self._MASTER_KEY),
+            patch(
+                "litellm.proxy._experimental.mcp_server.auth.user_api_key_auth_mcp.user_api_key_auth",
+                new_callable=AsyncMock,
+            ),
+            self._patch_user_reload(user_id="sso-user-42"),
+        ):
+            _auth, _h, _servers, _msah, oauth2_headers, raw_headers = await MCPRequestHandler.process_mcp_request(
+                self._scope(token)
+            )
+        # the request carried "Authorization: Bearer <session>"; both egress contexts must be scrubbed
+        assert oauth2_headers is None
+        assert not any(k.lower() == "authorization" for k in (raw_headers or {}))
+
     async def test_refresh_token_is_not_admitted_at_the_tool_edge(self):
         from datetime import datetime, timezone
 
@@ -6455,11 +6516,7 @@ class TestUserSubjectTeamUnion:
 
     @staticmethod
     def _admitted_subject(user_id):
-        from litellm.proxy._experimental.mcp_server.auth.user_api_key_auth_mcp import (
-            MCP_ADMITTED_USER_SUBJECT_METADATA,
-        )
-
-        return UserAPIKeyAuth(user_id=user_id, api_key=None, metadata={MCP_ADMITTED_USER_SUBJECT_METADATA: True})
+        return UserAPIKeyAuth(user_id=user_id, api_key=None, mcp_admitted_user_subject=True)
 
     async def test_keyless_user_unions_servers_across_all_their_teams(self):
         teams = {"team-a": self._team("team-a", ["srv1", "srv2"]), "team-b": self._team("team-b", ["srv2", "srv3"])}
@@ -6532,3 +6589,41 @@ class TestUserSubjectTeamUnion:
         with self._patch(teams_by_id=teams, user_teams=["team-a", "team-b"]):
             result = await MCPRequestHandler._get_allowed_mcp_servers_for_team(jwt_auth)
         assert result == []
+
+    async def test_forged_metadata_marker_on_a_real_key_grants_no_union(self):
+        """Security regression (forged admission marker): the admitted-subject marker is a
+        server-only ``UserAPIKeyAuth`` field, NOT a metadata key, precisely because virtual-key
+        metadata is caller-controlled at key creation. A user who sets
+        ``mcp_admitted_user_subject: true`` in their own key's metadata (api_key present, no
+        team_id) must NOT be treated as an admitted subject and must gain no cross-team union."""
+        teams = {"team-a": self._team("team-a", ["srv1"]), "team-b": self._team("team-b", ["srv2"])}
+        forged = UserAPIKeyAuth(
+            user_id="attacker",
+            api_key="sk-real-key",
+            metadata={"mcp_admitted_user_subject": True},  # caller-forged marker in key metadata
+        )
+        assert _is_mcp_admitted_user_subject(forged) is False
+        with self._patch(teams_by_id=teams, user_teams=["team-a", "team-b"]):
+            assert await MCPRequestHandler._team_ids_for_mcp_grant(forged) == []
+            assert await MCPRequestHandler._get_allowed_mcp_servers_for_team(forged) == []
+
+    async def test_admitted_subject_team_tool_restriction_binds(self):
+        """Security regression (team tool restrictions bypassed): a keyless admitted subject whose
+        granting team restricts ``srv1`` to ``{tool_a}`` must NOT receive allow-all on srv1. The
+        single-team-id tool lookup returns None (allow-all) for a keyless multi-team user, dropping
+        the exclusion; the union across granting teams restores it."""
+        from litellm.proxy._types import LiteLLM_ObjectPermissionTable, LiteLLM_TeamTable
+
+        team = LiteLLM_TeamTable(
+            team_id="team-a",
+            access_group_ids=[],
+            object_permission=LiteLLM_ObjectPermissionTable(
+                object_permission_id="op-team-a",
+                mcp_servers=["srv1"],
+                mcp_tool_permissions={"srv1": ["tool_a"]},
+            ),
+        )
+        auth = self._admitted_subject("sso-user")
+        with self._patch(teams_by_id={"team-a": team}, user_teams=["team-a"]):
+            tools = await MCPRequestHandler.get_allowed_tools_for_server("srv1", auth)
+        assert tools == ["tool_a"]

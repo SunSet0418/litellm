@@ -2589,6 +2589,12 @@ class UserAPIKeyAuth(LiteLLM_VerificationTokenView):  # the expected response ob
     user_max_budget: Optional[float] = None
     request_route: Optional[str] = None
     is_session_token: bool = False
+    # Server-only marker set exclusively by the MCP gateway admission path
+    # (_reload_admitted_user) for a keyless user-subject admitted via a gateway DCR session
+    # bearer or bridge envelope. Not a DB column and never populated from caller-controlled key
+    # metadata or JWT claims, so it cannot be forged to gain the team-inherited MCP grant union
+    # or to escape the caller-Authorization egress scrub. exclude=True keeps it out of serialization.
+    mcp_admitted_user_subject: bool = Field(default=False, exclude=True)
     budget_reservation: Optional[Dict[str, Any]] = Field(default=None, exclude=True)
     budget_throttle_pct: Optional[float] = Field(default=None, exclude=True)
     user: Optional[Any] = None  # Expanded user object when expand=user is used
