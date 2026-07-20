@@ -2615,6 +2615,10 @@ class UserAPIKeyAuth(LiteLLM_VerificationTokenView):  # the expected response ob
         # If values is already an instance (not a dict), return it as-is
         if not isinstance(values, dict):
             return values
+        # mcp_admitted_user_subject is a server-only marker, set ONLY by the MCP gateway admission
+        # path via post-construction assignment. Strip it from any validated input (constructor
+        # kwargs, model_validate, a JWT/key claim splat) so it can never be forged from caller data.
+        values.pop("mcp_admitted_user_subject", None)
         if values.get("api_key") is not None:
             values.update({"token": cls._safe_hash_litellm_api_key(values.get("api_key"))})
             if isinstance(values.get("api_key"), str):

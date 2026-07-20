@@ -840,14 +840,18 @@ class MCPRequestHandler:
             raise HTTPException(status_code=401, detail="Invalid or expired credential")
         if isinstance(user_object.metadata, dict) and user_object.metadata.get("scim_active") is False:
             raise HTTPException(status_code=401, detail="Invalid or expired credential")
-        return UserAPIKeyAuth(
+        admitted = UserAPIKeyAuth(
             user_id=user_object.user_id,
             user_role=user_object.user_role,
             org_id=user_object.organization_id,
             object_permission=object_permission,
             object_permission_id=user_object.object_permission_id,
-            mcp_admitted_user_subject=True,
         )
+        # Set the server-only admission marker AFTER construction: the before-validator strips it
+        # from any validated input, so a post-construction assignment is the only way to set it, and
+        # caller-supplied data (key metadata, JWT claims) can never forge it.
+        admitted.mcp_admitted_user_subject = True
+        return admitted
 
     @staticmethod
     async def _reload_admitted_key(key_hash: str) -> UserAPIKeyAuth:
@@ -1252,9 +1256,7 @@ class MCPRequestHandler:
                 # only access path — so the flag must not zero their team grants.
                 require_key_access = general_settings.get("require_key_mcp_access_defined", False)
                 base = (
-                    team_set
-                    if (not require_key_access or _is_mcp_admitted_user_subject(user_api_key_auth))
-                    else set()
+                    team_set if (not require_key_access or _is_mcp_admitted_user_subject(user_api_key_auth)) else set()
                 )
             else:
                 base = key_set & team_set  # both restrict → intersect
@@ -1318,11 +1320,7 @@ class MCPRequestHandler:
             # _allowed_mcp_servers_for_single_team (each team's grant capped by that team's org), so
             # the single primary-org cap must not run for it — otherwise the primary org would
             # re-clip servers a cross-org team legitimately granted. Key/JWT auth is unchanged.
-            if (
-                user_api_key_auth
-                and user_api_key_auth.org_id
-                and not _is_mcp_admitted_user_subject(user_api_key_auth)
-            ):
+            if user_api_key_auth and user_api_key_auth.org_id and not _is_mcp_admitted_user_subject(user_api_key_auth):
                 allowed_mcp_servers_for_org = await MCPRequestHandler._get_allowed_mcp_servers_for_org(
                     user_api_key_auth
                 )
@@ -1468,9 +1466,7 @@ class MCPRequestHandler:
                     # DB per team, so a transient failure must NOT collapse to the outer handler's
                     # allow-all (None). Deny this server's tools for the request (the client retries),
                     # mirroring the fail-closed server path (get_allowed_mcp_servers returns []).
-                    verbose_logger.debug(
-                        "admitted-subject tool resolution failed closed (%s)", type(exc).__name__
-                    )
+                    verbose_logger.debug("admitted-subject tool resolution failed closed (%s)", type(exc).__name__)
                     return []
 
             # Apply same inheritance logic as get_allowed_mcp_servers
@@ -1720,9 +1716,7 @@ class MCPRequestHandler:
         return list({server for servers in per_team for server in servers})
 
     @staticmethod
-    async def _admitted_subject_team_tools(
-        server_id: str, user_api_key_auth: UserAPIKeyAuth
-    ) -> Optional[List[str]]:
+    async def _admitted_subject_team_tools(server_id: str, user_api_key_auth: UserAPIKeyAuth) -> Optional[List[str]]:
         """Effective team tool-allowlist for ``server_id`` for a keyless admitted subject, unioned
         across every team of theirs that grants the server.
 

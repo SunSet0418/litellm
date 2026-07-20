@@ -212,7 +212,8 @@ class TestMCPRequestHandler:
         keyless gateway/bridge-admitted subject whose ONLY access path is team membership must still
         inherit the team's servers. The flag zeros empty *virtual keys* that must declare their own
         access; a keyless admitted user has no key to declare it on, so it must not be zeroed."""
-        auth = UserAPIKeyAuth(api_key=None, user_id="sso-user", mcp_admitted_user_subject=True)
+        auth = UserAPIKeyAuth(api_key=None, user_id="sso-user")
+        auth.mcp_admitted_user_subject = True
         with (
             patch.object(MCPRequestHandler, "_get_allowed_mcp_servers_for_key", new_callable=AsyncMock, return_value=[]),
             patch.object(
@@ -6517,7 +6518,9 @@ class TestUserSubjectTeamUnion:
 
     @staticmethod
     def _admitted_subject(user_id):
-        return UserAPIKeyAuth(user_id=user_id, api_key=None, mcp_admitted_user_subject=True)
+        auth = UserAPIKeyAuth(user_id=user_id, api_key=None)
+        auth.mcp_admitted_user_subject = True
+        return auth
 
     async def test_keyless_user_unions_servers_across_all_their_teams(self):
         teams = {"team-a": self._team("team-a", ["srv1", "srv2"]), "team-b": self._team("team-b", ["srv2", "srv3"])}
@@ -6720,3 +6723,15 @@ class TestUserSubjectTeamUnion:
             result = await MCPRequestHandler._get_allowed_mcp_servers_for_team(auth)
         # e is granted by T_A but orgA {a,b,c} excludes it, so it is NOT reachable even though orgB allows e
         assert set(result) == {"a", "c", "d"}
+
+    async def test_admission_marker_cannot_be_set_from_validated_input(self):
+        """Defense-in-depth: the mcp_admitted_user_subject marker is server-only. Supplying it in any
+        validated input (constructor kwargs OR model_validate, e.g. a future JWT/key claim splat) is
+        stripped by the before-validator, so ONLY the admission path's post-construction assignment
+        can set it."""
+        via_kwarg = UserAPIKeyAuth(user_id="u", api_key=None, mcp_admitted_user_subject=True)
+        via_validate = UserAPIKeyAuth.model_validate({"user_id": "u", "mcp_admitted_user_subject": True})
+        assert via_kwarg.mcp_admitted_user_subject is False
+        assert via_validate.mcp_admitted_user_subject is False
+        assert _is_mcp_admitted_user_subject(via_kwarg) is False
+        assert _is_mcp_admitted_user_subject(via_validate) is False
