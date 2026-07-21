@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from typing import Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -53,9 +54,9 @@ def _make_app() -> FastAPI:
 
 # Stub the auth dependency so we don't need a real proxy running.
 def _override_auth():
-    from litellm.proxy._types import UserAPIKeyAuth
+    from litellm.proxy._types import LitellmUserRoles, UserAPIKeyAuth
 
-    return UserAPIKeyAuth(api_key="sk-test", user_id="admin")
+    return UserAPIKeyAuth(api_key="sk-test", user_id="admin", user_role=LitellmUserRoles.PROXY_ADMIN)
 
 
 # A real (non-None) prisma stub for truthiness checks.
@@ -184,6 +185,52 @@ class TestToolManagementEndpoints:
     def test_tool_spend_no_db_returns_500(self):
         resp = self.client.get("/v1/tool/spend")
         assert resp.status_code == 500
+
+    def test_tool_spend_end_date_is_inclusive_via_exclusive_next_day_bound(self):
+        prisma = MagicMock()
+        prisma.db.query_raw = AsyncMock(return_value=[])
+        with patch("litellm.proxy.proxy_server.prisma_client", prisma):
+            resp = self.client.get("/v1/tool/spend?start_date=2026-07-01&end_date=2026-07-02")
+        assert resp.status_code == 200
+        query_args = prisma.db.query_raw.await_args.args
+        assert query_args[1] == datetime(2026, 7, 1, tzinfo=timezone.utc).isoformat()
+        assert query_args[2] == datetime(2026, 7, 3, tzinfo=timezone.utc).isoformat()
+        assert resp.json()["end_date"] == "2026-07-02"
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "start_date=not-a-date",
+            "start_date=2026-02-30",
+            "start_date=07/01/2026",
+            "end_date=2026-13-01",
+            "end_date=20260701",
+        ],
+    )
+    def test_tool_spend_malformed_date_returns_400(self, query: str):
+        prisma = MagicMock()
+        prisma.db.query_raw = AsyncMock(return_value=[])
+        with patch("litellm.proxy.proxy_server.prisma_client", prisma):
+            resp = self.client.get(f"/v1/tool/spend?{query}")
+        assert resp.status_code == 400
+        assert "Invalid date format" in resp.json()["detail"]
+        prisma.db.query_raw.assert_not_awaited()
+
+    def test_tool_spend_non_admin_returns_403(self):
+        from litellm.proxy._types import LitellmUserRoles, UserAPIKeyAuth
+        from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
+
+        app = _make_app()
+        app.dependency_overrides[user_api_key_auth] = lambda: UserAPIKeyAuth(
+            api_key="sk-user", user_id="u1", user_role=LitellmUserRoles.INTERNAL_USER
+        )
+        client = TestClient(app, raise_server_exceptions=True)
+        prisma = MagicMock()
+        prisma.db.query_raw = AsyncMock(return_value=[])
+        with patch("litellm.proxy.proxy_server.prisma_client", prisma):
+            resp = client.get("/v1/tool/spend")
+        assert resp.status_code == 403
+        prisma.db.query_raw.assert_not_awaited()
 
 
 class TestBuildToolSpendResponse:

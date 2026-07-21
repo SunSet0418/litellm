@@ -49,17 +49,35 @@ describe("computeCacheLeakage", () => {
     expect(rows[0].uncachedPromptTokens).toBe(1500);
   });
 
-  it("prices leakage at the portfolio's realized cache-read discount", () => {
+  it("subtracts cache reads and writes from prompt tokens instead of double-counting them", () => {
     const results = [
       day("2026-07-01", {
-        cacher: { alias: "cacher", metrics: { cache_read_input_tokens: 1000, prompt_caching_savings_spend: 2.0 } },
+        h1: {
+          alias: "svc-a",
+          metrics: { prompt_tokens: 1000, cache_read_input_tokens: 400, cache_creation_input_tokens: 100 },
+        },
+      }),
+    ];
+    const { rows } = computeCacheLeakage(results);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].uncachedPromptTokens).toBe(500);
+    expect(rows[0].cacheHitRatio).toBeCloseTo(0.4, 6);
+  });
+
+  it("prices leakage at the portfolio's realized cache-read discount and drops fully cached keys", () => {
+    const results = [
+      day("2026-07-01", {
+        cacher: {
+          alias: "cacher",
+          metrics: { prompt_tokens: 1000, cache_read_input_tokens: 1000, prompt_caching_savings_spend: 2.0 },
+        },
         leaker: { alias: "leaker", metrics: { prompt_tokens: 500 } },
       }),
     ];
     const { rows, discountPerToken } = computeCacheLeakage(results);
     expect(discountPerToken).toBeCloseTo(0.002, 6);
-    const leaker = rows.find((r) => r.keyAlias === "leaker")!;
-    expect(leaker.estSavingsLeft).toBeCloseTo(1.0, 6);
+    expect(rows.map((r) => r.keyAlias)).toEqual(["leaker"]);
+    expect(rows[0].estSavingsLeft).toBeCloseTo(1.0, 6);
   });
 
   it("returns null estimate and ranks by uncached tokens when nobody used caching", () => {
@@ -75,16 +93,17 @@ describe("computeCacheLeakage", () => {
     expect(rows.every((r) => r.estSavingsLeft === null)).toBe(true);
   });
 
-  it("computes cache hit ratio and drops keys with no prompt tokens", () => {
+  it("computes cache hit ratio against total prompt tokens and clamps inconsistent data at zero", () => {
     const results = [
       day("2026-07-01", {
         onlycache: { alias: "onlycache", metrics: { cache_read_input_tokens: 100 } },
-        mixed: { alias: "mixed", metrics: { prompt_tokens: 250, cache_read_input_tokens: 750 } },
+        mixed: { alias: "mixed", metrics: { prompt_tokens: 1000, cache_read_input_tokens: 750 } },
       }),
     ];
     const { rows } = computeCacheLeakage(results);
     expect(rows.map((r) => r.keyAlias)).toEqual(["mixed"]);
     expect(rows[0].cacheHitRatio).toBeCloseTo(0.75, 6);
+    expect(rows[0].uncachedPromptTokens).toBe(250);
   });
 
   it("respects the row limit", () => {

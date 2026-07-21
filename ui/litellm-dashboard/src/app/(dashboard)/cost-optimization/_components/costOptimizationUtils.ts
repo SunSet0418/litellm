@@ -20,16 +20,18 @@ export interface CacheLeakageResult {
 interface KeyAccumulator {
   keyAlias: string | null;
   teamId: string | null;
-  uncachedPromptTokens: number;
+  promptTokens: number;
   cacheReadTokens: number;
+  cacheCreationTokens: number;
   realizedCachingSavings: number;
 }
 
 const emptyAccumulator = (): KeyAccumulator => ({
   keyAlias: null,
   teamId: null,
-  uncachedPromptTokens: 0,
+  promptTokens: 0,
   cacheReadTokens: 0,
+  cacheCreationTokens: 0,
   realizedCachingSavings: 0,
 });
 
@@ -43,8 +45,9 @@ export const computeCacheLeakage = (results: readonly DailyData[], limit = 10): 
       const next: KeyAccumulator = {
         keyAlias: acc.keyAlias ?? entry.metadata?.key_alias ?? null,
         teamId: acc.teamId ?? entry.metadata?.team_id ?? null,
-        uncachedPromptTokens: acc.uncachedPromptTokens + (m.prompt_tokens ?? 0),
+        promptTokens: acc.promptTokens + (m.prompt_tokens ?? 0),
         cacheReadTokens: acc.cacheReadTokens + (m.cache_read_input_tokens ?? 0),
+        cacheCreationTokens: acc.cacheCreationTokens + (m.cache_creation_input_tokens ?? 0),
         realizedCachingSavings: acc.realizedCachingSavings + (m.prompt_caching_savings_spend ?? 0),
       };
       byKey.set(apiKey, next);
@@ -61,20 +64,20 @@ export const computeCacheLeakage = (results: readonly DailyData[], limit = 10): 
   const discountPerToken = totals.cacheReadTokens > 0 ? totals.realizedCachingSavings / totals.cacheReadTokens : null;
 
   const rows: CacheLeakageRow[] = [...byKey.entries()]
-    .filter(([, a]) => a.uncachedPromptTokens > 0)
     .map(([apiKey, a]) => {
-      const denom = a.cacheReadTokens + a.uncachedPromptTokens;
+      const uncachedPromptTokens = Math.max(0, a.promptTokens - a.cacheReadTokens - a.cacheCreationTokens);
       return {
         apiKey,
         keyAlias: a.keyAlias,
         teamId: a.teamId,
-        uncachedPromptTokens: a.uncachedPromptTokens,
+        uncachedPromptTokens,
         cacheReadTokens: a.cacheReadTokens,
-        cacheHitRatio: denom > 0 ? a.cacheReadTokens / denom : 0,
+        cacheHitRatio: a.promptTokens > 0 ? a.cacheReadTokens / a.promptTokens : 0,
         realizedCachingSavings: a.realizedCachingSavings,
-        estSavingsLeft: discountPerToken != null ? a.uncachedPromptTokens * discountPerToken : null,
+        estSavingsLeft: discountPerToken != null ? uncachedPromptTokens * discountPerToken : null,
       };
-    });
+    })
+    .filter((row) => row.uncachedPromptTokens > 0);
 
   const sorted = rows.sort((x, y) =>
     discountPerToken != null

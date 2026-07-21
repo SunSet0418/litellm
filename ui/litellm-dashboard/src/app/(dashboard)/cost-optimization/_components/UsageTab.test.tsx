@@ -125,7 +125,7 @@ describe("UsageTab", () => {
     });
     const d = day("2026-07-12", {});
     d.breakdown.api_keys = {
-      "hash-caching": key("caching-key", { prompt_tokens: 100, cache_read_input_tokens: 900 }),
+      "hash-caching": key("caching-key", { prompt_tokens: 1000, cache_read_input_tokens: 900 }),
       "hash-leaky": key("leaky-key", { prompt_tokens: 10000, cache_read_input_tokens: 0 }),
     };
 

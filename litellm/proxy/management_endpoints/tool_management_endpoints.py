@@ -19,7 +19,7 @@ if TYPE_CHECKING:
     from litellm.proxy.utils import PrismaClient
 
 from litellm._logging import verbose_proxy_logger
-from litellm.proxy._types import CommonProxyErrors, UserAPIKeyAuth
+from litellm.proxy._types import CommonProxyErrors, LitellmUserRoles, UserAPIKeyAuth
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 from litellm.repositories.object_permission_repository import ObjectPermissionRepository
 from litellm.repositories.table_repositories import (
@@ -127,14 +127,16 @@ async def list_tools(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-def _parse_day_bound(value: str | None, *, end_of_day: bool) -> datetime | None:
+def _parse_day_start(value: str | None) -> datetime | None:
     if not value:
         return None
-    suffix = "T23:59:59" if end_of_day else "T00:00:00"
     try:
-        return datetime.strptime(value + suffix, "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+        return datetime.strptime(value.strip(), "%Y-%m-%d").replace(tzinfo=timezone.utc)
     except ValueError:
-        return None
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid date format: {value}. Expected: 'YYYY-MM-DD'",
+        )
 
 
 class _ToolSpendRow(TypedDict, total=False):
@@ -205,33 +207,44 @@ async def get_tool_spend(
     """
     from litellm.proxy.proxy_server import prisma_client
 
+    if user_api_key_dict.user_role not in (
+        LitellmUserRoles.PROXY_ADMIN,
+        LitellmUserRoles.PROXY_ADMIN_VIEW_ONLY,
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Only proxy admin roles can view tool spend across the deployment",
+        )
+
     if prisma_client is None:
         raise HTTPException(status_code=500, detail=CommonProxyErrors.db_not_connected_error.value)
 
     now = datetime.now(timezone.utc)
-    end_dt = _parse_day_bound(end_date, end_of_day=True) or now
-    start_dt = _parse_day_bound(start_date, end_of_day=False) or (end_dt - timedelta(days=30))
+    end_day = _parse_day_start(end_date)
+    start_dt = _parse_day_start(start_date) or ((end_day or now) - timedelta(days=30))
+    end_exclusive = (end_day + timedelta(days=1)) if end_day else now
 
     rows = await prisma_client.db.query_raw(
         """
-        SELECT to_char(ti.start_time AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS date,
+        SELECT to_char(ti.start_time, 'YYYY-MM-DD') AS date,
                ti.tool_name AS tool_name,
                COUNT(*)::int AS call_count,
                COALESCE(SUM(sl.spend), 0)::double precision AS spend,
                COALESCE(SUM(sl.total_tokens), 0)::bigint AS total_tokens
         FROM "LiteLLM_SpendLogToolIndex" ti
         JOIN "LiteLLM_SpendLogs" sl ON sl.request_id = ti.request_id
-        WHERE ti.start_time >= $1 AND ti.start_time <= $2
+        WHERE ti.start_time >= ($1::timestamptz AT TIME ZONE 'UTC')
+          AND ti.start_time < ($2::timestamptz AT TIME ZONE 'UTC')
         GROUP BY date, ti.tool_name
         ORDER BY date ASC, spend DESC
         """,
-        start_dt,
-        end_dt,
+        start_dt.isoformat(),
+        end_exclusive.isoformat(),
     )
     return _build_tool_spend_response(
         rows=list(rows or []),
         start_date=start_dt.strftime("%Y-%m-%d"),
-        end_date=end_dt.strftime("%Y-%m-%d"),
+        end_date=(end_day or now).strftime("%Y-%m-%d"),
     )
 
 
