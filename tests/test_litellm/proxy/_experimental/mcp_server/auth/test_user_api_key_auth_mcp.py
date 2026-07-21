@@ -215,7 +215,9 @@ class TestMCPRequestHandler:
         auth = UserAPIKeyAuth(api_key=None, user_id="sso-user")
         auth.mcp_admitted_user_subject = True
         with (
-            patch.object(MCPRequestHandler, "_get_allowed_mcp_servers_for_key", new_callable=AsyncMock, return_value=[]),
+            patch.object(
+                MCPRequestHandler, "_get_allowed_mcp_servers_for_key", new_callable=AsyncMock, return_value=[]
+            ),
             patch.object(
                 MCPRequestHandler,
                 "_get_allowed_mcp_servers_for_team",
@@ -5447,7 +5449,9 @@ class TestMCPDcrBridgeDelegateAdmission:
         with (
             patch("litellm.proxy._experimental.mcp_server.mcp_server_manager.global_mcp_server_manager") as mock_mgr,
             patch("litellm.proxy.proxy_server.master_key", self._MASTER_KEY),
-            self._patch_user_reload(return_value=MagicMock(user_id="offboarded-user", organization_id=None, metadata={"scim_active": False})),
+            self._patch_user_reload(
+                return_value=MagicMock(user_id="offboarded-user", organization_id=None, metadata={"scim_active": False})
+            ),
         ):
             mock_mgr.get_mcp_server_by_name.return_value = self._bridge_delegate_server()
             with pytest.raises(HTTPException) as exc_info:
@@ -6230,7 +6234,9 @@ class TestAggregateGatewayDcrChallenge:
             with pytest.raises(HTTPException) as exc_info:
                 await MCPRequestHandler.process_mcp_request(self._scope())
         www_authenticate = (exc_info.value.headers or {})["WWW-Authenticate"]
-        assert 'resource_metadata="http://testserver/.well-known/oauth-protected-resource/litellm/mcp"' in www_authenticate
+        assert (
+            'resource_metadata="http://testserver/.well-known/oauth-protected-resource/litellm/mcp"' in www_authenticate
+        )
 
     async def test_no_challenge_for_explicit_litellm_key(self):
         """An explicit x-litellm-api-key declares a litellm-key client; a typo
@@ -6251,9 +6257,7 @@ class TestAggregateGatewayDcrChallenge:
             patch(self._AUTH_PATCH_TARGET, side_effect=self._auth_401()),
         ):
             with pytest.raises(ProxyException):
-                await MCPRequestHandler.process_mcp_request(
-                    self._scope(extra_headers=((b"x-mcp-servers", b"github"),))
-                )
+                await MCPRequestHandler.process_mcp_request(self._scope(extra_headers=((b"x-mcp-servers", b"github"),)))
 
     async def test_no_challenge_for_path_named_server(self):
         """/mcp/{server} targets one server; the aggregate challenge must not
@@ -6595,13 +6599,16 @@ class TestUserSubjectTeamUnion:
         assert await MCPRequestHandler._team_ids_for_mcp_grant(UserAPIKeyAuth(api_key=None)) == []
         # keyless with a user_id but NOT admission-marked (JWT auth) -> nothing (unchanged behavior)
         with self._patch(teams_by_id={}, user_teams=["t2", "t3"]):
-            assert await MCPRequestHandler._team_ids_for_mcp_grant(
-                UserAPIKeyAuth(api_key=None, user_id="jwt-user")
-            ) == []
+            assert (
+                await MCPRequestHandler._team_ids_for_mcp_grant(UserAPIKeyAuth(api_key=None, user_id="jwt-user")) == []
+            )
         # UI sentinel -> nothing
-        assert await MCPRequestHandler._team_ids_for_mcp_grant(
-            UserAPIKeyAuth(api_key="sk", team_id=UI_TEAM_ID, user_id="u")
-        ) == []
+        assert (
+            await MCPRequestHandler._team_ids_for_mcp_grant(
+                UserAPIKeyAuth(api_key="sk", team_id=UI_TEAM_ID, user_id="u")
+            )
+            == []
+        )
 
     async def test_jwt_keyless_user_without_team_claim_does_not_union(self):
         """Regression for the review finding: a JWT-authenticated caller is also keyless with a
@@ -6708,3 +6715,255 @@ class TestUserSubjectTeamUnion:
         assert via_validate.mcp_admitted_user_subject is False
         assert _is_mcp_admitted_user_subject(via_kwarg) is False
         assert _is_mcp_admitted_user_subject(via_validate) is False
+
+
+@pytest.mark.asyncio
+class TestAdmittedSubjectPerTeamOrgCap:
+    """A keyless admitted subject unions grants across teams that may span organizations. Each team's
+    grant (servers AND tools) is capped by that team's OWN org, and the user's direct grants by the
+    user's own org — never the caller's primary org applied over the whole cross-org union. Guards the
+    Veria 'team grants bypass their owning policies' finding."""
+
+    def _team(self, team_id, mcp_servers, *, org_id=None, tool_perms=None, members=("sso-user",)):
+        from litellm.proxy._types import LiteLLM_ObjectPermissionTable, LiteLLM_TeamTable, Member
+
+        return LiteLLM_TeamTable(
+            team_id=team_id,
+            organization_id=org_id,
+            members_with_roles=[Member(user_id=u, role="user") for u in members],
+            access_group_ids=[],
+            object_permission=LiteLLM_ObjectPermissionTable(
+                object_permission_id=f"op-{team_id}",
+                mcp_servers=mcp_servers,
+                mcp_tool_permissions=tool_perms,
+            ),
+        )
+
+    @staticmethod
+    def _admitted_subject(user_id, *, org_id=None, own_servers=None, own_tool_perms=None):
+        from litellm.proxy._types import LiteLLM_ObjectPermissionTable
+
+        op = None
+        if own_servers is not None or own_tool_perms is not None:
+            op = LiteLLM_ObjectPermissionTable(
+                object_permission_id=f"userop-{user_id}",
+                mcp_servers=own_servers or [],
+                mcp_tool_permissions=own_tool_perms,
+            )
+        auth = UserAPIKeyAuth(user_id=user_id, api_key=None, org_id=org_id, object_permission=op)
+        auth.mcp_admitted_user_subject = True
+        return auth
+
+    #: sentinel for org_perms: org has an object_permission_id but its load returns None (a swallowed
+    #: DB error / dangling id), which _object_permission_for_org must treat as fail-closed.
+    LOAD_FAILS = "__load_fails__"
+
+    @contextlib.contextmanager
+    def _patch(self, *, teams_by_id, user_teams, org_perms=None, registry=None):
+        """org_perms: {org_id: LiteLLM_ObjectPermissionTable | None | LOAD_FAILS}.
+        - table  → org exists, ceiling = that permission.
+        - None   → org exists but carries no object_permission (no ceiling).
+        - LOAD_FAILS → org exists with an object_permission_id, but the permission load returns None.
+        - org_id ABSENT from the map → org row missing: get_org_object RAISES a bare Exception, exactly
+          as production does (it does NOT return None or raise HTTPException)."""
+        org_perms = org_perms or {}
+
+        async def _get_team_object(team_id, **kw):
+            return teams_by_id.get(team_id)
+
+        async def _get_user_object(user_id, **kw):
+            return MagicMock(user_id=user_id, teams=user_teams)
+
+        async def _get_org_object(org_id, **kw):
+            if org_id not in org_perms:
+                raise Exception(f"Organization doesn't exist. Org={org_id}.")  # matches production
+            op = org_perms[org_id]
+            has_permission_id = op is not None  # a table OR LOAD_FAILS carries an id; None does not
+            return MagicMock(
+                organization_id=org_id,
+                object_permission_id=(f"orgop-{org_id}" if has_permission_id else None),
+            )
+
+        async def _get_object_permission(object_permission_id, **kw):
+            for oid, op in org_perms.items():
+                if op is not None and op != self.LOAD_FAILS and object_permission_id == f"orgop-{oid}":
+                    return op
+            return None  # LOAD_FAILS (or an unknown id) → None, simulating get_object_permission's swallow
+
+        cms = [
+            patch("litellm.proxy.auth.auth_checks.get_team_object", _get_team_object),
+            patch("litellm.proxy.auth.auth_checks.get_user_object", _get_user_object),
+            patch("litellm.proxy.auth.auth_checks.get_org_object", _get_org_object),
+            patch("litellm.proxy.auth.auth_checks.get_object_permission", _get_object_permission),
+            patch(
+                "litellm.proxy.auth.auth_checks._get_mcp_server_ids_from_access_groups",
+                AsyncMock(return_value=[]),
+            ),
+            patch("litellm.proxy.proxy_server.prisma_client", MagicMock()),
+            patch("litellm.proxy.proxy_server.user_api_key_cache", MagicMock()),
+            patch("litellm.proxy.proxy_server.proxy_logging_obj", MagicMock()),
+        ]
+        if registry is not None:
+            from litellm.proxy._experimental.mcp_server.mcp_server_manager import (
+                global_mcp_server_manager,
+            )
+
+            cms.append(
+                patch.object(global_mcp_server_manager, "get_registry", return_value={s: MagicMock() for s in registry})
+            )
+        with contextlib.ExitStack() as es:
+            for cm in cms:
+                es.enter_context(cm)
+            yield
+
+    # ---- server axis ----
+
+    async def test_team_grant_capped_by_its_own_org(self):
+        from litellm.proxy._types import LiteLLM_ObjectPermissionTable
+
+        teams = {"team-a": self._team("team-a", ["srv1", "srv2"], org_id="org-a")}
+        org_perms = {"org-a": LiteLLM_ObjectPermissionTable(object_permission_id="orgop-org-a", mcp_servers=["srv1"])}
+        auth = self._admitted_subject("sso-user")
+        with self._patch(teams_by_id=teams, user_teams=["team-a"], org_perms=org_perms):
+            result = await MCPRequestHandler._get_allowed_mcp_servers_for_team(auth)
+        assert set(result) == {"srv1"}  # srv2 capped out by org-a's ceiling
+
+    async def test_cross_org_teams_each_capped_by_own_org(self):
+        from litellm.proxy._types import LiteLLM_ObjectPermissionTable
+
+        teams = {
+            "team-a": self._team("team-a", ["srv1", "srv2"], org_id="org-a"),
+            "team-b": self._team("team-b", ["srv3", "srv4"], org_id="org-b"),
+        }
+        org_perms = {
+            "org-a": LiteLLM_ObjectPermissionTable(object_permission_id="orgop-org-a", mcp_servers=["srv1"]),
+            "org-b": LiteLLM_ObjectPermissionTable(object_permission_id="orgop-org-b", mcp_servers=["srv3"]),
+        }
+        auth = self._admitted_subject("sso-user")
+        with self._patch(teams_by_id=teams, user_teams=["team-a", "team-b"], org_perms=org_perms):
+            result = await MCPRequestHandler._get_allowed_mcp_servers_for_team(auth)
+        assert set(result) == {"srv1", "srv3"}  # each team clipped by its OWN org, then unioned
+
+    async def test_all_proxy_grant_capped_by_org(self):
+        from litellm.proxy._types import LiteLLM_ObjectPermissionTable, SpecialMCPServerName
+
+        teams = {"team-a": self._team("team-a", [SpecialMCPServerName.all_proxy_servers.value], org_id="org-a")}
+        org_perms = {"org-a": LiteLLM_ObjectPermissionTable(object_permission_id="orgop-org-a", mcp_servers=["srv1"])}
+        auth = self._admitted_subject("sso-user")
+        with self._patch(
+            teams_by_id=teams, user_teams=["team-a"], org_perms=org_perms, registry=["srv1", "srv2", "srv3"]
+        ):
+            result = await MCPRequestHandler._get_allowed_mcp_servers_for_team(auth)
+        # all_proxy expands to the whole registry, then org-a caps to {srv1} — the cell the old partial
+        # patch missed (it returned the full registry before capping).
+        assert set(result) == {"srv1"}
+
+    async def test_org_row_without_object_permission_does_not_cap(self):
+        teams = {"team-a": self._team("team-a", ["srv1", "srv2"], org_id="org-a")}
+        auth = self._admitted_subject("sso-user")
+        with self._patch(teams_by_id=teams, user_teams=["team-a"], org_perms={"org-a": None}):
+            result = await MCPRequestHandler._get_allowed_mcp_servers_for_team(auth)
+        assert set(result) == {"srv1", "srv2"}  # empty ceiling = no restriction
+
+    async def test_direct_grants_unioned_with_team_and_capped_by_user_org(self):
+        from litellm.proxy._types import LiteLLM_ObjectPermissionTable
+
+        teams = {"team-a": self._team("team-a", ["srv1"], org_id="org-a")}
+        org_perms = {
+            "org-a": None,  # the team's org imposes no ceiling
+            "org-u": LiteLLM_ObjectPermissionTable(object_permission_id="orgop-org-u", mcp_servers=["srvD", "srv1"]),
+        }
+        auth = self._admitted_subject("sso-user", org_id="org-u", own_servers=["srvD", "srvX"])
+        with self._patch(teams_by_id=teams, user_teams=["team-a"], org_perms=org_perms):
+            result = await MCPRequestHandler.get_allowed_mcp_servers(auth)
+        # direct {srvD,srvX} ∩ user-org {srvD,srv1} = {srvD}; UNIONed with team {srv1} (not intersected).
+        # srvX capped out by the user's org; team's srv1 NOT clipped by the user's primary org.
+        assert set(result) == {"srvD", "srv1"}
+
+    async def test_single_team_key_uses_primary_org_cap_not_per_team(self):
+        from litellm.proxy._types import LiteLLM_ObjectPermissionTable
+
+        # A KEY (not admitted): the per-team org cap must NOT fire; the top-level primary-org cap applies,
+        # byte-identical to before. team-a (org-a) grants {srv1,srv2}; the key's primary org is org-k.
+        teams = {"team-a": self._team("team-a", ["srv1", "srv2"], org_id="org-a")}
+        org_perms = {
+            "org-a": LiteLLM_ObjectPermissionTable(object_permission_id="orgop-org-a", mcp_servers=["srv2"]),
+            "org-k": LiteLLM_ObjectPermissionTable(object_permission_id="orgop-org-k", mcp_servers=["srv1"]),
+        }
+        key_auth = UserAPIKeyAuth(user_id="u", api_key="sk-hash", team_id="team-a", org_id="org-k")
+        with self._patch(teams_by_id=teams, user_teams=["team-a"], org_perms=org_perms):
+            result = await MCPRequestHandler.get_allowed_mcp_servers(key_auth)
+        # If the per-team (org-a) cap wrongly fired, team-a would clip to {srv2} then org-k → {} (empty).
+        # Correct key behavior: no per-team cap; primary-org (org-k) cap → {srv1}.
+        assert set(result) == {"srv1"}
+
+    # ---- tool axis ----
+
+    async def test_org_tool_ceiling_binds_when_team_places_no_tool_restriction(self):
+        from litellm.proxy._types import LiteLLM_ObjectPermissionTable
+
+        # team grants srv1 with NO tool restriction; org-a restricts srv1's tools to {tool_a}.
+        teams = {"team-a": self._team("team-a", ["srv1"], org_id="org-a")}
+        org_perms = {
+            "org-a": LiteLLM_ObjectPermissionTable(
+                object_permission_id="orgop-org-a",
+                mcp_servers=["srv1"],
+                mcp_tool_permissions={"srv1": ["tool_a"]},
+            )
+        }
+        auth = self._admitted_subject("sso-user")
+        with self._patch(teams_by_id=teams, user_teams=["team-a"], org_perms=org_perms):
+            tools = await MCPRequestHandler.get_allowed_tools_for_server("srv1", auth)
+        # Without the per-team org tool ceiling this would be None (all tools) — org-a's tool ceiling
+        # would be bypassed exactly like the server case.
+        assert tools == ["tool_a"]
+
+    async def test_tool_union_across_cross_org_teams(self):
+        teams = {
+            "team-a": self._team("team-a", ["srv1"], org_id="org-a", tool_perms={"srv1": ["t1"]}),
+            "team-b": self._team("team-b", ["srv1"], org_id="org-b", tool_perms={"srv1": ["t2"]}),
+        }
+        auth = self._admitted_subject("sso-user")
+        with self._patch(teams_by_id=teams, user_teams=["team-a", "team-b"], org_perms={"org-a": None, "org-b": None}):
+            tools = await MCPRequestHandler.get_allowed_tools_for_server("srv1", auth)
+        assert set(tools) == {"t1", "t2"}
+
+    async def test_tool_deny_all_when_team_grant_and_org_tool_ceiling_disjoint(self):
+        from litellm.proxy._types import LiteLLM_ObjectPermissionTable
+
+        teams = {"team-a": self._team("team-a", ["srv1"], org_id="org-a", tool_perms={"srv1": ["t1"]})}
+        org_perms = {
+            "org-a": LiteLLM_ObjectPermissionTable(
+                object_permission_id="orgop-org-a",
+                mcp_servers=["srv1"],
+                mcp_tool_permissions={"srv1": ["t2"]},
+            )
+        }
+        auth = self._admitted_subject("sso-user")
+        with self._patch(teams_by_id=teams, user_teams=["team-a"], org_perms=org_perms):
+            tools = await MCPRequestHandler.get_allowed_tools_for_server("srv1", auth)
+        # team {t1} ∩ org {t2} = {} → deny every tool ([]), NOT allow-all (None).
+        assert tools == []
+
+    # ---- error contract (adversarial-review findings) ----
+
+    async def test_missing_org_row_is_treated_as_no_ceiling_not_lockout(self):
+        """A team's organization_id may point to an org row that no longer exists (deleted / not yet
+        synced). get_org_object RAISES a bare Exception for that; it must be treated as 'no ceiling' and
+        must NOT lock the admitted subject out of the team's grants (parity with the key path, which
+        tolerates a deleted org)."""
+        teams = {"team-a": self._team("team-a", ["srv1", "srv2"], org_id="org-gone")}
+        auth = self._admitted_subject("sso-user")
+        with self._patch(teams_by_id=teams, user_teams=["team-a"], org_perms={}):  # org-gone absent → raises
+            result = await MCPRequestHandler._get_allowed_mcp_servers_for_team(auth)
+        assert set(result) == {"srv1", "srv2"}
+
+    async def test_org_permission_load_failure_fails_closed(self):
+        """The org carries an object_permission_id but the permission load returns None (a swallowed DB
+        error / dangling id). The ceiling cannot be verified, so the admitted subject must fail CLOSED
+        for that team — NOT skip the ceiling, which would leak org-forbidden servers."""
+        teams = {"team-a": self._team("team-a", ["srv1", "srv2"], org_id="org-a")}
+        auth = self._admitted_subject("sso-user")
+        with self._patch(teams_by_id=teams, user_teams=["team-a"], org_perms={"org-a": self.LOAD_FAILS}):
+            result = await MCPRequestHandler._get_allowed_mcp_servers_for_team(auth)
+        assert result == []  # fail closed, not {srv1, srv2}

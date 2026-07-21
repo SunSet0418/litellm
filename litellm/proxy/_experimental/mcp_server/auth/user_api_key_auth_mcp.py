@@ -790,14 +790,15 @@ class MCPRequestHandler:
         identity: the reloaded ``user_id``, the user's own MCP object permission, and the user's
         ``org_id`` ride on the returned ``UserAPIKeyAuth``, and the SAME ``get_allowed_mcp_servers``
         the key path uses then computes which servers the user may reach, so the user's litellm MCP
-        grants and access groups gate the request exactly as a key's do. Binding ``org_id`` keeps the
-        org-level MCP ceiling in force for this admission rather than silently skipping it; a user's
-        primary organization is used, so a user who spans organizations is capped conservatively (the
-        ceiling can only narrow the result, never broaden it). Only the user's OWN object permission is
-        bound: a ``UserAPIKeyAuth`` carries a single ``team_id`` while a user may belong to many teams,
-        so team-inherited MCP grants for a user are a follow-up (they need a many-teams union
-        ``get_allowed_mcp_servers`` does not do off one auth object). The caller's centralized policy
-        gate enforces the user's live budget and org state, and a SCIM-deactivated owner fails closed.
+        grants and access groups gate the request exactly as a key's do. Because the returned auth is
+        stamped ``mcp_admitted_user_subject`` (below), ``get_allowed_mcp_servers`` unions the servers the
+        user reaches through ANY of their teams on top of these direct grants — a ``UserAPIKeyAuth``
+        pins one ``team_id`` but a user belongs to many, so the team fan-out happens off the marker, not
+        the single ``team_id``. Each source is bounded by ITS OWN org: the user's direct grants by the
+        bound ``org_id`` (their primary org), and each team's grant by that team's owning org inside
+        ``_allowed_mcp_servers_for_single_team`` — so a user who spans organizations does not leak one
+        org's servers past another org's ceiling. The caller's centralized policy gate enforces the
+        user's live budget and org state, and a SCIM-deactivated owner fails closed.
 
         Error handling mirrors the key path's retryable-503 contract, but ``get_user_object`` defeats a
         type-based check: where ``get_key_object`` raises a typed ``ProxyException`` for a missing key
@@ -850,6 +851,17 @@ class MCPRequestHandler:
             # (user_api_key_auth.py). The parallel limiter reads these off the auth object rather than
             # re-fetching, and treats None as sys.maxsize (unlimited), so a keyless admitted user with
             # them unset would invoke tools past their configured user RPM/TPM.
+            #
+            # Rate-limit model for the keyless admitted subject: the user is bounded by their USER
+            # rpm/tpm (copied here; the limiter descriptors key off user_id, which is set). Per-team and
+            # per-key MCP rate limits (`mcp_rpm_limit`) are deliberately NOT enforced for this subject —
+            # their limiter descriptors key off `team_id` / `api_key`, which a subject that unions across
+            # many teams under its own identity does not have. Those limits are ceilings on a team's or
+            # a key's *shared* usage bucket; charging a cross-team user's calls into a specific team's
+            # bucket has no correct attribution (a server may be granted by several teams) and would let
+            # one user drain a team's budget against its own keys. Enforcing per-team throttling for
+            # union users needs a new per-(user, team) descriptor and is tracked as follow-up; the user
+            # rpm/tpm above is the control that bounds this subject today.
             user_tpm_limit=user_object.tpm_limit,
             user_rpm_limit=user_object.rpm_limit,
         )
@@ -1246,6 +1258,22 @@ class MCPRequestHandler:
             team_set = set(allowed_mcp_servers_for_team)
             grants_set = set(key_access_group_grants)
 
+            # Keyless admitted subject (gateway session / bridge user): direct grants and each team's
+            # grants are INDEPENDENT, additive sources — the user reaches a server granted to them
+            # directly OR through ANY of their teams — so union them rather than intersect (key∩team
+            # below is a ceiling model for virtual keys, which under-grants a user whose direct and
+            # team grants are disjoint). Each source is capped by ITS OWN org: the team union is
+            # already capped per-team in _allowed_mcp_servers_for_single_team; the user's direct grants
+            # are capped by the user's own org here. The primary-org top-level cap below is deliberately
+            # skipped — applying the caller's primary org over a cross-org union would let a team's
+            # servers ride on the caller's home org and bypass the team's OWN owning-org ceiling.
+            if _is_mcp_admitted_user_subject(user_api_key_auth):
+                return await MCPRequestHandler._admitted_subject_reachable_servers(
+                    key_set | grants_set,
+                    team_set,
+                    user_api_key_auth.org_id if user_api_key_auth else None,
+                )
+
             has_lower_level_mcp_restrictions = bool(key_set or team_set or grants_set)
 
             # 1. Key/team ceiling. An empty set means "this level does not restrict".
@@ -1260,10 +1288,10 @@ class MCPRequestHandler:
                 # can declare their own access; a keyless gateway/bridge-admitted
                 # user has no key to declare access on — team membership IS their
                 # only access path — so the flag must not zero their team grants.
+                # A keyless admitted subject returned above and never reaches this virtual-key ceiling,
+                # so require_key_mcp_access_defined can only ever zero a real key's inherited team grants.
                 require_key_access = general_settings.get("require_key_mcp_access_defined", False)
-                base = (
-                    team_set if (not require_key_access or _is_mcp_admitted_user_subject(user_api_key_auth)) else set()
-                )
+                base = team_set if not require_key_access else set()
             else:
                 base = key_set & team_set  # both restrict → intersect
 
@@ -1322,23 +1350,53 @@ class MCPRequestHandler:
             #########################################################
             # Apply org-level ceiling if org_id is set
             #########################################################
-            if user_api_key_auth and user_api_key_auth.org_id:
-                allowed_mcp_servers_for_org = await MCPRequestHandler._get_allowed_mcp_servers_for_org(
-                    user_api_key_auth
-                )
-                if len(allowed_mcp_servers_for_org) > 0:
-                    if has_lower_level_mcp_restrictions:
-                        # Lower-level restrictions exist, so org can only cap them.
-                        allowed_mcp_servers = [s for s in allowed_mcp_servers if s in allowed_mcp_servers_for_org]
-                    else:
-                        # No lower-level restrictions → org list becomes the ceiling
-                        allowed_mcp_servers = allowed_mcp_servers_for_org
-                    verbose_logger.debug(f"Applied org ceiling filter. Final allowed servers: {allowed_mcp_servers}")
+            allowed_mcp_servers = await MCPRequestHandler._apply_primary_org_ceiling(
+                allowed_mcp_servers, user_api_key_auth, has_lower_level_mcp_restrictions
+            )
 
             return list(set(allowed_mcp_servers))
         except Exception as e:
             verbose_logger.warning(f"Failed to get allowed MCP servers: {str(e)}")
             return []
+
+    @staticmethod
+    async def _apply_primary_org_ceiling(
+        allowed_mcp_servers: list[str],
+        user_api_key_auth: UserAPIKeyAuth | None,
+        has_lower_level_mcp_restrictions: bool,
+    ) -> list[str]:
+        """Cap the resolved server list by the caller's PRIMARY org ceiling (the non-admitted path; an
+        admitted subject is capped per-team by each team's own org and returns before this). If the org
+        names an explicit MCP list, lower-level restrictions are intersected with it, else the org list
+        becomes the ceiling. No org, or an empty org list, leaves the result unchanged."""
+        if not (user_api_key_auth and user_api_key_auth.org_id):
+            return allowed_mcp_servers
+        allowed_mcp_servers_for_org = await MCPRequestHandler._get_allowed_mcp_servers_for_org(user_api_key_auth)
+        if len(allowed_mcp_servers_for_org) == 0:
+            return allowed_mcp_servers
+        if has_lower_level_mcp_restrictions:
+            # Lower-level restrictions exist, so org can only cap them.
+            capped = [s for s in allowed_mcp_servers if s in allowed_mcp_servers_for_org]
+        else:
+            # No lower-level restrictions → org list becomes the ceiling.
+            capped = allowed_mcp_servers_for_org
+        verbose_logger.debug(f"Applied org ceiling filter. Final allowed servers: {capped}")
+        return capped
+
+    @staticmethod
+    async def _admitted_subject_reachable_servers(
+        direct_servers: set[str], team_servers: set[str], org_id: str | None
+    ) -> list[str]:
+        """Reachable MCP servers for a keyless admitted subject: the user's own direct grants capped by
+        their OWN org, UNIONed with the team grants (already capped per-team by each team's org in
+        ``_allowed_mcp_servers_for_single_team``). Direct and team grants are independent, additive
+        sources, so they union; the caller's primary-org top-level cap is NOT applied over the union — it
+        would let a team's servers ride on the caller's home org and bypass the team's owning-org
+        ceiling."""
+        ceiling = await MCPRequestHandler._org_mcp_server_ceiling(org_id)
+        if ceiling is not None:
+            direct_servers = direct_servers & ceiling
+        return list(direct_servers | team_servers)
 
     @staticmethod
     def _get_key_object_permission(
@@ -1456,12 +1514,16 @@ class MCPRequestHandler:
                 else None
             )
 
-            # A keyless gateway/bridge-admitted user has no single team_id, so team_obj_perm above
-            # is None and the single-team lookup yields allow-all — silently dropping every team's
-            # per-server tool exclusions. Recompute the team restriction as the union across ALL
-            # teams of theirs that grant the server, so a team's mcp_tool_permissions still bind.
+            # A keyless gateway/bridge-admitted user has no single team_id, so team_obj_perm above is
+            # None and the single-team lookup yields allow-all — silently dropping every team's per-server
+            # tool exclusions. Resolve the effective allowlist as the UNION across every source that
+            # grants the server (each of the user's teams capped by its OWN org, plus the user's own
+            # direct grant capped by the user's org), so a team's — and its org's — mcp_tool_permissions
+            # bind. Returns here: the generic key∩team intersect, the agent intersect (no agent_id on an
+            # admitted subject), and the primary-org tool ceiling below are the virtual-key model and
+            # would mis-cap a cross-org union.
             if _is_mcp_admitted_user_subject(user_api_key_auth):
-                team_tools = await MCPRequestHandler._admitted_subject_team_tools(server_id, user_api_key_auth)
+                return await MCPRequestHandler._admitted_subject_tool_allowlist(server_id, user_api_key_auth, key_tools)
 
             # Apply same inheritance logic as get_allowed_mcp_servers
             if team_tools:
@@ -1714,15 +1776,23 @@ class MCPRequestHandler:
         return list({server for servers in per_team for server in servers})
 
     @staticmethod
-    async def _admitted_subject_team_tools(server_id: str, user_api_key_auth: UserAPIKeyAuth) -> List[str] | None:
-        """Effective team tool-allowlist for ``server_id`` for a keyless admitted subject, unioned
-        across every team of theirs that grants the server.
+    async def _admitted_subject_tool_allowlist(
+        server_id: str, user_api_key_auth: UserAPIKeyAuth, key_tools: list[str] | None
+    ) -> list[str] | None:
+        """Effective tool allowlist on ``server_id`` for a keyless admitted subject: the UNION across
+        every source that grants the server — each of the user's teams that grant it (capped by that
+        team's OWN org) plus the user's own direct grant (capped by the user's org).
 
-        A keyless gateway/bridge-admitted user has no single ``team_id``, so the standard
-        single-team tool lookup returns None (allow-all) and drops team tool exclusions. Access is
-        the union of the user's teams' grants, so: return None (no restriction) when a granting team
-        places no tool restriction on the server, otherwise the union of the granting teams' explicit
-        tool allowlists."""
+        Returns None = allow every tool (some granting source imposes no tool restriction), or a list =
+        the union of the granting sources' allowlists (empty list = deny every tool, e.g. when a team's
+        grant and its org's tool ceiling are disjoint). A source contributes ONLY when it actually grants
+        the server: a source that does not reach the server is ABSENT, not "allow all", so a server
+        reachable through one team's restricted grant is never silently widened to every tool by an
+        unrelated source that happens to place no restriction (that conflation is the bug this replaces).
+
+        ``key_tools`` is the user's own resolved tool restriction on the server (None = the user's
+        object_permission places none). Mirrors the server axis's per-source org capping so a team's — or
+        the user's own — owning-org tool ceiling cannot be bypassed."""
         from litellm.proxy._experimental.mcp_server.mcp_server_manager import (
             global_mcp_server_manager,
         )
@@ -1735,8 +1805,12 @@ class MCPRequestHandler:
 
         if prisma_client is None:
             return None
+
+        contributions: list[set[str] | None] = []
+
+        # Team sources: each team that grants the server contributes its tool restriction, capped by
+        # that team's OWN org's tool ceiling (the tool-axis sibling of the per-team server cap).
         team_ids = await MCPRequestHandler._team_ids_for_mcp_grant(user_api_key_auth)
-        restricted: set[str] = set()
         for team_id in team_ids:
             granted = set(await MCPRequestHandler._allowed_mcp_servers_for_single_team(team_id, user_api_key_auth))
             if server_id not in granted:
@@ -1749,17 +1823,46 @@ class MCPRequestHandler:
                 proxy_logging_obj=proxy_logging_obj,
             )
             op = team_obj.object_permission if team_obj else None
-            team_restriction = (
+            raw = (
                 global_mcp_server_manager.expand_tool_permissions(op.mcp_tool_permissions).get(server_id)
                 if op and op.mcp_tool_permissions
                 else None
             )
-            if not team_restriction:
-                # None OR an empty list both mean "no tool restriction from this team" — matching the
-                # single-team path's `if team_tools:` truthiness — so the union widens to all tools.
-                return None
-            restricted |= set(team_restriction)
-        return list(restricted) if restricted else None
+            team_restriction = set(raw) if raw else None
+            org_ceiling = await MCPRequestHandler._org_mcp_tool_ceiling(
+                team_obj.organization_id if team_obj else None, server_id
+            )
+            contributions.append(MCPRequestHandler._tool_ceiling_intersect(team_restriction, org_ceiling))
+
+        # Direct source: contributes only when the user's OWN grants reach the server (mirrors the
+        # server-axis direct portion — key servers + key access-group grants, capped by the user's org).
+        direct_servers = set(await MCPRequestHandler._get_allowed_mcp_servers_for_key(user_api_key_auth)) | set(
+            await MCPRequestHandler._get_key_access_group_mcp_server_extras(user_api_key_auth)
+        )
+        user_server_ceiling = await MCPRequestHandler._org_mcp_server_ceiling(
+            user_api_key_auth.org_id if user_api_key_auth else None
+        )
+        if user_server_ceiling is not None:
+            direct_servers &= user_server_ceiling
+        if server_id in direct_servers:
+            direct_restriction = set(key_tools) if key_tools is not None else None
+            direct_org_ceiling = await MCPRequestHandler._org_mcp_tool_ceiling(
+                user_api_key_auth.org_id if user_api_key_auth else None, server_id
+            )
+            contributions.append(MCPRequestHandler._tool_ceiling_intersect(direct_restriction, direct_org_ceiling))
+
+        if not contributions:
+            # Server reachable but no source imposed a tool restriction (e.g. granted via a bare
+            # server/access-group grant) → allow every tool.
+            return None
+        if any(c is None for c in contributions):
+            # A granting source allows every tool → the union allows every tool.
+            return None
+        merged: set[str] = set()
+        for c in contributions:
+            if c is not None:  # None already short-circuited above; guard keeps the type checker honest
+                merged |= c
+        return list(merged)
 
     @staticmethod
     async def _team_ids_for_mcp_grant(user_api_key_auth: UserAPIKeyAuth | None) -> list[str]:
@@ -1813,11 +1916,36 @@ class MCPRequestHandler:
         return list(dict.fromkeys(t for t in user_object.teams if t and t != UI_TEAM_ID))
 
     @staticmethod
+    async def _team_granted_servers(team_obj: LiteLLM_TeamTable, team_access_group_servers: list[str]) -> set[str]:
+        """The raw MCP-server set a team grants (before any org ceiling): its object_permission (direct
+        ``mcp_servers``, the ``all_proxy_servers`` sentinel → the full registry, legacy access groups,
+        tool-perm-referenced servers) unioned with its unified ``access_group_ids`` servers."""
+        from litellm.proxy._experimental.mcp_server.mcp_server_manager import (
+            global_mcp_server_manager,
+        )
+
+        object_permissions = team_obj.object_permission
+        if object_permissions is None:
+            return set(team_access_group_servers)
+        if SpecialMCPServerName.all_proxy_servers.value in (object_permissions.mcp_servers or []):
+            return set(global_mcp_server_manager.get_registry().keys())
+        legacy_access_group_servers = await MCPRequestHandler._get_mcp_servers_from_access_groups(
+            object_permissions.mcp_access_groups or []
+        )
+        return (
+            set(global_mcp_server_manager.expand_permission_list(object_permissions.mcp_servers or []))
+            | set(legacy_access_group_servers)
+            | set(global_mcp_server_manager.expand_tool_permissions(object_permissions.mcp_tool_permissions).keys())
+            | set(team_access_group_servers)
+        )
+
+    @staticmethod
     async def _allowed_mcp_servers_for_single_team(
         team_id: str,
         user_api_key_auth: UserAPIKeyAuth | None,
     ) -> list[str]:
-        """Allowed MCP servers granted by ONE team.
+        """Allowed MCP servers granted by ONE team (its raw grant, then capped by the team's own org
+        for a keyless admitted subject).
 
         Unions two sources:
         - Legacy team.object_permission (mcp_servers, mcp_access_groups,
@@ -1828,9 +1956,6 @@ class MCPRequestHandler:
           the gate (no assigned_team_ids check needed here).
         """
         try:
-            from litellm.proxy._experimental.mcp_server.mcp_server_manager import (
-                global_mcp_server_manager,
-            )
             from litellm.proxy.auth.auth_checks import (
                 _get_mcp_server_ids_from_access_groups,
                 get_team_object,
@@ -1886,27 +2011,19 @@ class MCPRequestHandler:
                 proxy_logging_obj=proxy_logging_obj,
             )
 
-            object_permissions = team_obj.object_permission
-            if object_permissions is None:
-                return list(set(team_access_group_servers))
+            servers = await MCPRequestHandler._team_granted_servers(team_obj, team_access_group_servers)
 
-            if SpecialMCPServerName.all_proxy_servers.value in (object_permissions.mcp_servers or []):
-                return list(global_mcp_server_manager.get_registry().keys())
-
-            direct_mcp_servers = global_mcp_server_manager.expand_permission_list(object_permissions.mcp_servers or [])
-
-            legacy_access_group_servers = await MCPRequestHandler._get_mcp_servers_from_access_groups(
-                object_permissions.mcp_access_groups or []
-            )
-
-            tool_perm_servers = list(
-                global_mcp_server_manager.expand_tool_permissions(object_permissions.mcp_tool_permissions).keys()
-            )
-
-            all_servers = (
-                direct_mcp_servers + legacy_access_group_servers + tool_perm_servers + team_access_group_servers
-            )
-            return list(set(all_servers))
+            # Per-team org ceiling: a keyless admitted subject unions grants across teams that may span
+            # organizations, so each team's grant must be capped by ITS OWN org — not the caller's primary
+            # org (get_allowed_mcp_servers skips the primary-org top-level cap for admitted subjects for
+            # exactly this reason). Applied at the single return point so EVERY source above — including the
+            # all_proxy sentinel expansion — is bounded. A single-team key is not an admitted subject, so its
+            # behavior is unchanged (the top-level primary-org cap still applies to it).
+            if _is_mcp_admitted_user_subject(user_api_key_auth):
+                org_ceiling = await MCPRequestHandler._org_mcp_server_ceiling(team_obj.organization_id)
+                if org_ceiling is not None:
+                    servers &= org_ceiling
+            return list(servers)
         except Exception as e:
             verbose_logger.warning(f"Failed to get allowed MCP servers for team: {str(e)}")
             return []
@@ -1993,6 +2110,122 @@ class MCPRequestHandler:
         except Exception as e:
             verbose_logger.warning(f"Failed to get allowed MCP servers for org: {str(e)}")
             return []
+
+    @staticmethod
+    async def _object_permission_for_org(org_id: str | None):
+        """Resolve a SPECIFIC org's object_permission by org_id (e.g. a granting team's owning org),
+        reusing the same ``get_org_object`` / ``get_object_permission`` resolvers + ``user_api_key_cache``
+        the caller-primary-org path uses. Unlike ``_get_org_object_permission`` this is keyed on an
+        explicit org_id, so each team's grant can be capped by its OWN org rather than the caller's
+        primary org.
+
+        This org cap is the ONLY org enforcement for a keyless union (``common_checks`` never runs a
+        per-team gate for a ``team_id``-less subject), so it fails CLOSED on a genuine DB error rather
+        than silently dropping a ceiling that may exist. The error contract, pinned to the ACTUAL
+        behavior of the shared resolvers (not assumptions):
+        - No ``org_id`` / no DB / org exists but carries no ``object_permission_id`` → None ("no ceiling").
+        - Missing org row → None. ``get_org_object`` raises a bare ``Exception`` for a missing org AND for
+          a DB outage (original in ``__context__``); ``_raise_503_if_db_unavailable`` re-raises a retryable
+          503 for a real outage (it walks the cause chain) and a genuinely-missing org falls through to
+          None. This matches the key path, which tolerates a deleted org rather than locking the caller
+          out — never a bare ``HTTPException`` (``get_org_object`` does not raise one).
+        - ``get_object_permission`` swallows every DB error to None, so a None for an org that DOES carry
+          an ``object_permission_id`` is a load failure (or a dangling id), not "no permission" — raise a
+          503 so the caller fails closed instead of skipping a ceiling that may exist. Every 503 raised
+          here is absorbed by the caller's ``except`` into the deny value ([] / None-for-admitted) and
+          never surfaces raw."""
+        if not org_id:
+            return None
+        from litellm.proxy.auth.auth_checks import get_object_permission, get_org_object
+        from litellm.proxy.proxy_server import (
+            prisma_client,
+            proxy_logging_obj,
+            user_api_key_cache,
+        )
+
+        if prisma_client is None:
+            return None
+        try:
+            org_obj = await get_org_object(
+                org_id=org_id,
+                prisma_client=prisma_client,
+                user_api_key_cache=user_api_key_cache,
+                parent_otel_span=None,
+                proxy_logging_obj=proxy_logging_obj,
+            )
+        except Exception as e:  # noqa: BLE001  # missing org → no ceiling; a real DB outage re-raises 503 (fail closed)
+            MCPRequestHandler._raise_503_if_db_unavailable(e)
+            return None
+        if org_obj is None or not org_obj.object_permission_id:
+            return None
+        op = await get_object_permission(
+            object_permission_id=org_obj.object_permission_id,
+            prisma_client=prisma_client,
+            user_api_key_cache=user_api_key_cache,
+            parent_otel_span=None,
+            proxy_logging_obj=proxy_logging_obj,
+        )
+        if op is None:
+            # The org carries an object_permission_id but the permission did not load. get_object_permission
+            # swallows DB errors to None, so with a valid id a None is a load failure (or a dangling id),
+            # not "no permission" — fail closed rather than silently drop a ceiling that may exist.
+            raise HTTPException(
+                status_code=503,
+                detail="Service Unavailable: organization MCP permission could not be loaded",
+            )
+        return op
+
+    @staticmethod
+    async def _org_mcp_server_ceiling(org_id: str | None) -> set[str] | None:
+        """The MCP-server allowlist an org imposes, or None when it imposes none.
+
+        None = "this org places no restriction" (allow-all from this level); a non-empty set = the exact
+        servers the org permits. Mirrors ``_get_allowed_mcp_servers_for_org``'s sources (direct
+        ``mcp_servers``, legacy access groups, tool-perm-referenced servers) but keyed on an explicit
+        org_id and returning a set/None so callers can intersect — a ceiling only ever narrows, it never
+        grants."""
+        op = await MCPRequestHandler._object_permission_for_org(org_id)
+        if op is None:
+            return None
+        from litellm.proxy._experimental.mcp_server.mcp_server_manager import (
+            global_mcp_server_manager,
+        )
+
+        servers = set(global_mcp_server_manager.expand_permission_list(op.mcp_servers or []))
+        servers |= set(await MCPRequestHandler._get_mcp_servers_from_access_groups(op.mcp_access_groups or []))
+        servers |= set(global_mcp_server_manager.expand_tool_permissions(op.mcp_tool_permissions).keys())
+        # An empty allowlist means the org has an object_permission but named no MCP servers → treat as
+        # "no restriction" (matching the len()>0 semantics of the existing primary-org cap), never deny-all.
+        return servers or None
+
+    @staticmethod
+    async def _org_mcp_tool_ceiling(org_id: str | None, server_id: str) -> set[str] | None:
+        """The tool allowlist an org imposes on ONE server, or None when it imposes none.
+
+        The tool-axis sibling of ``_org_mcp_server_ceiling``: without it a team in org B could grant a
+        server carrying no tool restriction while org B's own ``mcp_tool_permissions`` on that server are
+        never applied — the same bypass, one axis over. None = no tool restriction from this org (empty
+        list is treated as no restriction, matching the rest of the tool-permission code)."""
+        op = await MCPRequestHandler._object_permission_for_org(org_id)
+        if op is None or not op.mcp_tool_permissions:
+            return None
+        from litellm.proxy._experimental.mcp_server.mcp_server_manager import (
+            global_mcp_server_manager,
+        )
+
+        tools = global_mcp_server_manager.expand_tool_permissions(op.mcp_tool_permissions).get(server_id)
+        return set(tools) if tools else None
+
+    @staticmethod
+    def _tool_ceiling_intersect(grant: set[str] | None, ceiling: set[str] | None) -> set[str] | None:
+        """Apply a tool CEILING to a tool grant. None on either side means "no restriction from that
+        side", so the result is the other side; two real restrictions intersect (a ceiling only narrows).
+        An empty-set result means "deny every tool" and is preserved — it is NOT collapsed back to None."""
+        if grant is None:
+            return ceiling
+        if ceiling is None:
+            return grant
+        return grant & ceiling
 
     @staticmethod
     async def _get_allowed_mcp_servers_for_end_user(
