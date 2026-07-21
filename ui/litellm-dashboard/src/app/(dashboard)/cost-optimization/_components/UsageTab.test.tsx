@@ -129,11 +129,12 @@ describe("UsageTab", () => {
       "hash-leaky": key("leaky-key", { prompt_tokens: 10000, cache_read_input_tokens: 0 }),
     };
 
-    const { getByText } = renderWith([d]);
+    const { getByText, getAllByLabelText } = renderWith([d]);
 
     expect(getByText("leaky-key")).toBeInTheDocument();
     expect(getByText("0.0%")).toBeInTheDocument();
     expect(getByText("90.0%")).toBeInTheDocument();
+    expect(getAllByLabelText("info-circle")).toHaveLength(4);
   });
 
   it("renders spend-by-tool bars from the tool spend endpoint", async () => {

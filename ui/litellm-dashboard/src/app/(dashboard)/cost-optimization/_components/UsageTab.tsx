@@ -1,7 +1,8 @@
 "use client";
 
 import React, { useEffect, useMemo, useState } from "react";
-import { Collapse } from "antd";
+import { Collapse, Tooltip } from "antd";
+import { InfoCircleOutlined } from "@ant-design/icons";
 
 import { AreaChart, BarChart, DonutChart, DEFAULT_COLOR_CYCLE } from "@/components/shared/charts";
 import AdvancedDatePicker from "@/components/shared/advanced_date_picker";
@@ -47,6 +48,15 @@ const isoDay = (d: Date): string => d.toISOString().slice(0, 10);
 const compressionOf = (m: SpendMetrics): number => m.compression_savings_spend ?? 0;
 const cachingOf = (m: SpendMetrics): number => m.prompt_caching_savings_spend ?? 0;
 const savedTokensOf = (m: SpendMetrics): number => m.compression_saved_tokens ?? 0;
+
+const HeadWithInfo = ({ label, info }: { label: string; info: string }) => (
+  <span className="inline-flex items-center gap-1">
+    {label}
+    <Tooltip title={info}>
+      <InfoCircleOutlined className="text-gray-400 text-xs" />
+    </Tooltip>
+  </span>
+);
 
 const MethodologyNote = () => (
   <Collapse
@@ -251,10 +261,30 @@ const UsageTab: React.FC<UsageTabProps> = ({ accessToken, userId, userRole }) =>
               <TableHeader>
                 <TableRow>
                   <TableHead>Key</TableHead>
-                  <TableHead className="text-right">Uncached prompt tokens</TableHead>
-                  <TableHead className="text-right">Cache hit ratio</TableHead>
-                  <TableHead className="text-right">Realized caching savings</TableHead>
-                  <TableHead className="text-right">Est. savings left</TableHead>
+                  <TableHead className="text-right">
+                    <HeadWithInfo
+                      label="Uncached prompt tokens"
+                      info="Input tokens in the selected range that were neither read from nor written to the prompt cache"
+                    />
+                  </TableHead>
+                  <TableHead className="text-right">
+                    <HeadWithInfo
+                      label="Cache hit ratio"
+                      info="Share of this key's total input tokens that were served from the prompt cache"
+                    />
+                  </TableHead>
+                  <TableHead className="text-right">
+                    <HeadWithInfo
+                      label="Realized caching savings"
+                      info="Dollars this key actually saved because cached input was billed at the discounted cache-read rate"
+                    />
+                  </TableHead>
+                  <TableHead className="text-right">
+                    <HeadWithInfo
+                      label="Est. savings left"
+                      info="Approximate dollars this key could still save if its uncached input had hit the cache at the portfolio's realized discount"
+                    />
+                  </TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
