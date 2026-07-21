@@ -26801,6 +26801,7 @@
             },
             "spend": {
               "default": 0.0,
+              "description": "Attributed spend: a request that used several tools counts its full spend toward each of them",
               "title": "Spend",
               "type": "number"
             },
@@ -26860,6 +26861,7 @@
             },
             "total_spend": {
               "default": 0.0,
+              "description": "Deduplicated spend of every request that called at least one tool in the window; less than the sum of per-tool attributed spend whenever multi-tool requests exist",
               "title": "Total Spend",
               "type": "number"
             }
@@ -26963,6 +26965,13 @@
         },
         "ValidationError": {
           "properties": {
+            "ctx": {
+              "title": "Context",
+              "type": "object"
+            },
+            "input": {
+              "title": "Input"
+            },
             "loc": {
               "items": {
                 "anyOf": [
@@ -27408,7 +27417,7 @@
       },
       "/v1/tool/spend": {
         "get": {
-          "description": "Spend attributed to each tool over a date range, for the Cost Optimization dashboard.\n\nJoins ``LiteLLM_SpendLogToolIndex`` (which tool names ran on which request) to\n``LiteLLM_SpendLogs`` (what the request cost). A request that used multiple tools\ncounts its full spend toward each of those tools.",
+          "description": "Spend attributed to each tool over a date range, for the Cost Optimization dashboard.\n\nJoins ``LiteLLM_SpendLogToolIndex`` (which tool names ran on which request) to\n``LiteLLM_SpendLogs`` (what the request cost). A request that used multiple tools\ncounts its full spend toward each of those tools, so per-tool numbers are\nattributions. ``total_spend`` is the deduplicated spend of every request that\ncalled at least one tool in the window, so it never double counts.",
           "operationId": "get_tool_spend_v1_tool_spend_get",
           "parameters": [
             {

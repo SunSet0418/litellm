@@ -11,9 +11,11 @@ POST /v1/tool/policy            - Update the input_policy / output_policy for a 
 
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Annotated, Any, List, Optional, TypedDict
+from itertools import groupby
+from typing import TYPE_CHECKING, Annotated, Any, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel, TypeAdapter
 
 if TYPE_CHECKING:
     from litellm.proxy.utils import PrismaClient
@@ -139,7 +141,7 @@ def _parse_day_start(value: str | None) -> datetime | None:
         )
 
 
-class _ToolSpendRow(TypedDict, total=False):
+class _ToolSpendRow(BaseModel):
     date: str
     tool_name: str
     call_count: int
@@ -147,41 +149,42 @@ class _ToolSpendRow(TypedDict, total=False):
     total_tokens: int
 
 
-def _build_tool_spend_response(
-    rows: List[_ToolSpendRow],
-    start_date: str | None,
-    end_date: str | None,
-) -> ToolSpendResponse:
-    daily = tuple(
-        ToolSpendDailyEntry(
-            date=str(r.get("date") or ""),
-            tool_name=str(r.get("tool_name") or ""),
-            spend=float(r.get("spend") or 0.0),
-            call_count=int(r.get("call_count") or 0),
-        )
-        for r in rows
-        if r.get("tool_name")
+class _RequestTotalRow(BaseModel):
+    total_spend: float
+
+
+_TOOL_SPEND_ROWS = TypeAdapter(list[_ToolSpendRow])
+_REQUEST_TOTAL_ROWS = TypeAdapter(list[_RequestTotalRow])
+
+
+def _summarize_tool(name: str, grp: tuple[_ToolSpendRow, ...]) -> ToolSpendEntry:
+    return ToolSpendEntry(
+        tool_name=name,
+        spend=sum(r.spend for r in grp),
+        call_count=sum(r.call_count for r in grp),
+        total_tokens=sum(r.total_tokens for r in grp),
     )
-    tool_names = tuple(dict.fromkeys(d.tool_name for d in daily))
-    by_tool = tuple(
-        sorted(
-            (
-                ToolSpendEntry(
-                    tool_name=name,
-                    spend=sum(float(r.get("spend") or 0.0) for r in rows if r.get("tool_name") == name),
-                    call_count=sum(int(r.get("call_count") or 0) for r in rows if r.get("tool_name") == name),
-                    total_tokens=sum(int(r.get("total_tokens") or 0) for r in rows if r.get("tool_name") == name),
-                )
-                for name in tool_names
-            ),
-            key=lambda e: e.spend,
-            reverse=True,
-        )
+
+
+def _build_tool_spend_response(
+    rows: list[_ToolSpendRow],
+    total_spend: float,
+    start_date: str,
+    end_date: str,
+) -> ToolSpendResponse:
+    daily = [
+        ToolSpendDailyEntry(date=r.date, tool_name=r.tool_name, spend=r.spend, call_count=r.call_count) for r in rows
+    ]
+    grouped = groupby(sorted(rows, key=lambda r: r.tool_name), key=lambda r: r.tool_name)
+    by_tool = sorted(
+        (_summarize_tool(name, tuple(grp)) for name, grp in grouped),
+        key=lambda e: e.spend,
+        reverse=True,
     )
     return ToolSpendResponse(
-        by_tool=list(by_tool),
-        daily=list(daily),
-        total_spend=sum(e.spend for e in by_tool),
+        by_tool=by_tool,
+        daily=daily,
+        total_spend=total_spend,
         start_date=start_date,
         end_date=end_date,
     )
@@ -203,7 +206,9 @@ async def get_tool_spend(
 
     Joins ``LiteLLM_SpendLogToolIndex`` (which tool names ran on which request) to
     ``LiteLLM_SpendLogs`` (what the request cost). A request that used multiple tools
-    counts its full spend toward each of those tools.
+    counts its full spend toward each of those tools, so per-tool numbers are
+    attributions. ``total_spend`` is the deduplicated spend of every request that
+    called at least one tool in the window, so it never double counts.
     """
     from litellm.proxy.proxy_server import prisma_client
 
@@ -241,8 +246,25 @@ async def get_tool_spend(
         start_dt.isoformat(),
         end_exclusive.isoformat(),
     )
+    totals = await prisma_client.db.query_raw(
+        """
+        SELECT COALESCE(SUM(sl.spend), 0)::double precision AS total_spend
+        FROM "LiteLLM_SpendLogs" sl
+        WHERE EXISTS (
+            SELECT 1
+            FROM "LiteLLM_SpendLogToolIndex" ti
+            WHERE ti.request_id = sl.request_id
+              AND ti.start_time >= ($1::timestamptz AT TIME ZONE 'UTC')
+              AND ti.start_time < ($2::timestamptz AT TIME ZONE 'UTC')
+        )
+        """,
+        start_dt.isoformat(),
+        end_exclusive.isoformat(),
+    )
+    total_rows = _REQUEST_TOTAL_ROWS.validate_python(totals or [])
     return _build_tool_spend_response(
-        rows=list(rows or []),
+        rows=_TOOL_SPEND_ROWS.validate_python(rows or []),
+        total_spend=total_rows[0].total_spend if total_rows else 0.0,
         start_date=start_dt.strftime("%Y-%m-%d"),
         end_date=(end_day or now).strftime("%Y-%m-%d"),
     )

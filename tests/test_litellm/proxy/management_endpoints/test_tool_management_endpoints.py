@@ -21,6 +21,7 @@ sys.path.insert(0, os.path.abspath("../../.."))
 
 from litellm.proxy.management_endpoints.tool_management_endpoints import (
     _build_tool_spend_response,
+    _ToolSpendRow,
     router,
 )
 from litellm.types.tool_management import LiteLLM_ToolTableRow
@@ -167,7 +168,7 @@ class TestToolManagementEndpoints:
             {"date": "2026-07-01", "tool_name": "read_file", "call_count": 3, "spend": 2.0, "total_tokens": 300},
         ]
         prisma = MagicMock()
-        prisma.db.query_raw = AsyncMock(return_value=rows)
+        prisma.db.query_raw = AsyncMock(side_effect=[rows, [{"total_spend": 5.5}]])
         with patch("litellm.proxy.proxy_server.prisma_client", prisma):
             resp = self.client.get("/v1/tool/spend?start_date=2026-07-01&end_date=2026-07-02")
         assert resp.status_code == 200
@@ -180,6 +181,7 @@ class TestToolManagementEndpoints:
         assert len(body["daily"]) == 3
         assert body["start_date"] == "2026-07-01"
         assert body["end_date"] == "2026-07-02"
+        assert body["total_spend"] == 5.5
 
     @patch("litellm.proxy.proxy_server.prisma_client", None)
     def test_tool_spend_no_db_returns_500(self):
@@ -192,9 +194,13 @@ class TestToolManagementEndpoints:
         with patch("litellm.proxy.proxy_server.prisma_client", prisma):
             resp = self.client.get("/v1/tool/spend?start_date=2026-07-01&end_date=2026-07-02")
         assert resp.status_code == 200
-        query_args = prisma.db.query_raw.await_args.args
-        assert query_args[1] == datetime(2026, 7, 1, tzinfo=timezone.utc).isoformat()
-        assert query_args[2] == datetime(2026, 7, 3, tzinfo=timezone.utc).isoformat()
+        expected_binds = (
+            datetime(2026, 7, 1, tzinfo=timezone.utc).isoformat(),
+            datetime(2026, 7, 3, tzinfo=timezone.utc).isoformat(),
+        )
+        assert prisma.db.query_raw.await_count == 2
+        for call in prisma.db.query_raw.await_args_list:
+            assert tuple(call.args[1:]) == expected_binds
         assert resp.json()["end_date"] == "2026-07-02"
 
     @pytest.mark.parametrize(
@@ -233,22 +239,30 @@ class TestToolManagementEndpoints:
         prisma.db.query_raw.assert_not_awaited()
 
 
+def _spend_row(date: str, tool_name: str, spend: float, call_count: int = 1, total_tokens: int = 10) -> _ToolSpendRow:
+    return _ToolSpendRow(date=date, tool_name=tool_name, call_count=call_count, spend=spend, total_tokens=total_tokens)
+
+
 class TestBuildToolSpendResponse:
-    def test_multi_tool_request_double_counts_spend_per_tool(self):
+    def test_multi_tool_attribution_double_counts_per_tool_but_not_total(self):
         rows = [
-            {"date": "2026-07-01", "tool_name": "a", "call_count": 1, "spend": 3.0, "total_tokens": 10},
-            {"date": "2026-07-01", "tool_name": "b", "call_count": 1, "spend": 3.0, "total_tokens": 10},
+            _spend_row("2026-07-01", "a", spend=3.0),
+            _spend_row("2026-07-01", "b", spend=3.0),
         ]
-        resp = _build_tool_spend_response(rows, "2026-07-01", "2026-07-01")
+        resp = _build_tool_spend_response(rows, total_spend=3.0, start_date="2026-07-01", end_date="2026-07-01")
         by_tool = {t.tool_name: t.spend for t in resp.by_tool}
         assert by_tool == {"a": 3.0, "b": 3.0}
-        assert resp.total_spend == 6.0
+        assert resp.total_spend == 3.0
 
-    def test_skips_rows_without_tool_name(self):
+    def test_groups_across_days_and_sorts_by_spend(self):
         rows = [
-            {"date": "2026-07-01", "tool_name": "", "call_count": 1, "spend": 9.0, "total_tokens": 1},
-            {"date": "2026-07-01", "tool_name": "a", "call_count": 1, "spend": 1.0, "total_tokens": 1},
+            _spend_row("2026-07-01", "b", spend=1.0, call_count=2, total_tokens=100),
+            _spend_row("2026-07-02", "b", spend=4.0, call_count=1, total_tokens=50),
+            _spend_row("2026-07-01", "a", spend=2.0, call_count=3, total_tokens=300),
         ]
-        resp = _build_tool_spend_response(rows, None, None)
-        assert [t.tool_name for t in resp.by_tool] == ["a"]
-        assert resp.daily and all(d.tool_name == "a" for d in resp.daily)
+        resp = _build_tool_spend_response(rows, total_spend=7.0, start_date="2026-07-01", end_date="2026-07-02")
+        assert [(t.tool_name, t.spend, t.call_count, t.total_tokens) for t in resp.by_tool] == [
+            ("b", 5.0, 3, 150),
+            ("a", 2.0, 3, 300),
+        ]
+        assert len(resp.daily) == 3

@@ -17912,7 +17912,9 @@ export interface paths {
          *
          *     Joins ``LiteLLM_SpendLogToolIndex`` (which tool names ran on which request) to
          *     ``LiteLLM_SpendLogs`` (what the request cost). A request that used multiple tools
-         *     counts its full spend toward each of those tools.
+         *     counts its full spend toward each of those tools, so per-tool numbers are
+         *     attributions. ``total_spend`` is the deduplicated spend of every request that
+         *     called at least one tool in the window, so it never double counts.
          */
         get: operations["get_tool_spend_v1_tool_spend_get"];
         put?: never;
@@ -31860,6 +31862,7 @@ export interface components {
             call_count: number;
             /**
              * Spend
+             * @description Attributed spend: a request that used several tools counts its full spend toward each of them
              * @default 0
              */
             spend: number;
@@ -31883,6 +31886,7 @@ export interface components {
             start_date?: string | null;
             /**
              * Total Spend
+             * @description Deduplicated spend of every request that called at least one tool in the window; less than the sum of per-tool attributed spend whenever multi-tool requests exist
              * @default 0
              */
             total_spend: number;
